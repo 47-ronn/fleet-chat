@@ -8,7 +8,7 @@
   let mode = $state(hasStoredCreds() ? 'pin' : 'setup');
 
   let relayUrl = $state('wss://remote-agents-relay.pointg.workers.dev');
-  let room = $state('gpu');
+  let room = $state('');
   let token = $state('');
   let pin = $state('');
   let pin2 = $state('');
@@ -98,7 +98,7 @@
       <input bind:value={relayUrl} placeholder="wss://relay-host" autocomplete="off" />
 
       <label>Room</label>
-      <input bind:value={room} placeholder="gpu" autocomplete="off" />
+      <input bind:value={room} placeholder="room name" autocomplete="off" />
 
       <label>Room key (token)</label>
       <input bind:value={token} type="password" placeholder="••••••" autocomplete="off" />
@@ -128,7 +128,7 @@
 
       {#if error}<div class="err">{error}</div>{/if}
 
-      <button type="submit" disabled={busy || !token || !pin}>
+      <button type="submit" disabled={busy || !room.trim() || !token || !pin}>
         {busy ? 'Connecting…' : 'Save and sign in'}
       </button>
     </form>
