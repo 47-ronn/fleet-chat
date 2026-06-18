@@ -2,6 +2,8 @@
   import { Relay } from './lib/relay.js';
   import Auth from './lib/Auth.svelte';
   import Files from './lib/Files.svelte';
+  import Icon from './lib/Icon.svelte';
+  import { scale } from 'svelte/transition';
   import { storeCreds, clearCreds } from './lib/creds.js';
 
   let relay = $state(null);
@@ -75,12 +77,48 @@
     composerEl.style.height = Math.min(composerEl.scrollHeight, 180) + 'px';
   });
 
-  // Keep the transcript pinned to the latest message (also when the "typing…"
-  // bubble appears/disappears).
+  // --- transcript scroll follow + "jump to latest" button ---
+  // We only auto-follow when the user is already near the bottom; if they've
+  // scrolled up to read history we leave them there and surface a button (with
+  // an unread count) instead of yanking them down on every new message.
+  let atBottom = $state(true); // is the viewport near the latest message?
+  let newCount = $state(0); // messages arrived while scrolled up
+  let prevLen = 0; // transcript length on the last effect run
+  let prevKey = null; // active dialog on the last run (switch => force pin)
+
+  const NEAR_BOTTOM_PX = 80;
+
+  function onMessagesScroll() {
+    if (!messagesEl) return;
+    const dist = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight;
+    atBottom = dist < NEAR_BOTTOM_PX;
+    if (atBottom) newCount = 0;
+  }
+
+  function scrollToBottom(smooth = true) {
+    if (!messagesEl) return;
+    messagesEl.scrollTo({ top: messagesEl.scrollHeight, behavior: smooth ? 'smooth' : 'auto' });
+    atBottom = true;
+    newCount = 0;
+  }
+
+  // Pin to the latest message when following (or when the dialog changes), and
+  // otherwise tally how many messages arrived out of view.
   $effect(() => {
-    transcript;
-    sending;
-    if (messagesEl) messagesEl.scrollTop = messagesEl.scrollHeight;
+    const key = active;
+    const len = transcript.length;
+    sending; // also re-pin when the "typing…" bubble toggles
+    if (!messagesEl) return;
+    const dialogChanged = key !== prevKey;
+    if (dialogChanged || atBottom) {
+      messagesEl.scrollTop = messagesEl.scrollHeight; // instant; smooth is for the button
+      atBottom = true;
+      newCount = 0;
+    } else if (len > prevLen) {
+      newCount += len - prevLen;
+    }
+    prevKey = key;
+    prevLen = len;
   });
 
   const executors = $derived(agents.filter((a) => a.accepts_commands !== false));
@@ -672,16 +710,16 @@
         {#if activeDialog && activeDialog.live}
           <button class="ghost danger" onclick={() => terminateSession(activeDialog)}>End session</button>
         {/if}
-        <a class="ghost" href="#/" title="Home">← Home</a>
-        <button class="ghost" onclick={() => (showFiles = true)}>📁 Files</button>
-        <button class="ghost" onclick={openTunnels} title="Tunnels">🌐 Tunnels</button>
-        <button class="ghost" onclick={openSettings} title="Settings">⚙️</button>
-        <button class="ghost" onclick={logout}>Log out</button>
+        <a class="ghost ic" href="#/" title="Home"><Icon name="home" /><span>Home</span></a>
+        <button class="ghost ic" onclick={() => (showFiles = true)} title="Files"><Icon name="folder" /><span>Files</span></button>
+        <button class="ghost ic" onclick={openTunnels} title="Tunnels"><Icon name="cloud" /><span>Tunnels</span></button>
+        <button class="ghost ic icon-only" onclick={openSettings} title="Settings" aria-label="Settings"><Icon name="settings" /></button>
+        <button class="ghost ic" onclick={logout} title="Log out"><Icon name="logout" /><span>Log out</span></button>
         <button
-          class="ghost menu-toggle"
+          class="ghost ic icon-only menu-toggle"
           aria-label="Chat list"
           onclick={() => (sidebarOpen = !sidebarOpen)}
-        >☰</button>
+        ><Icon name="menu" /></button>
       </header>
 
       <!-- Host selector chips -->
@@ -705,7 +743,7 @@
         {/each}
       </div>
 
-      <div class="messages" bind:this={messagesEl}>
+      <div class="messages" bind:this={messagesEl} onscroll={onMessagesScroll}>
         {#if !activeDialog && !pendingChat}
           <div class="empty">
             <div class="logo">⚡ Fleet Chat</div>
@@ -782,6 +820,21 @@
         {/if}
       </div>
 
+      {#if !atBottom}
+        <button
+          class="scroll-fab"
+          transition:scale={{ duration: 160, start: 0.6 }}
+          onclick={() => scrollToBottom()}
+          aria-label="Scroll to latest"
+          title="Scroll to latest"
+        >
+          <Icon name="arrow-down" size={20} />
+          {#if newCount > 0}
+            <span class="fab-badge">{newCount > 99 ? '99+' : newCount}</span>
+          {/if}
+        </button>
+      {/if}
+
       <div class="composer">
         <textarea
           bind:this={composerEl}
@@ -800,7 +853,7 @@
                 : 'Message to the fleet…'}
           disabled={!canSend}
         ></textarea>
-        <button class="send" onclick={send} disabled={sending || !input.trim() || !canSend}>↑</button>
+        <button class="send" onclick={send} disabled={sending || !input.trim() || !canSend} aria-label="Send"><Icon name="arrow-up" size={18} draw={false} /></button>
       </div>
     </section>
 
@@ -811,7 +864,7 @@
 
     <!-- Dialog list (right) -->
     <aside class="sidebar" class:open={sidebarOpen}>
-      <button class="new" onclick={newChat}>＋ New chat</button>
+      <button class="new" onclick={newChat}><Icon name="plus" size={16} /><span>New chat</span></button>
 
       {#if inProgress.length > 0}
         <div class="sec-title">In progress</div>
@@ -1147,6 +1200,7 @@
     display: flex;
     flex-direction: column;
     min-width: 0;
+    position: relative; /* anchor for the scroll-to-latest FAB */
   }
   .sidebar {
     width: var(--sidebar-w);
@@ -1192,6 +1246,57 @@
     display: inline-flex;
     align-items: center;
     cursor: pointer;
+  }
+  /* Icon + label buttons: keep a small gap and color the icon on hover. */
+  .ghost.ic {
+    gap: 6px;
+  }
+  .ghost.ic:hover {
+    color: var(--text);
+    border-color: var(--accent);
+  }
+  .ghost.icon-only {
+    padding: 6px 8px;
+  }
+
+  /* Floating "jump to latest" button, sits above the composer on the right. */
+  .scroll-fab {
+    position: absolute;
+    right: 28px;
+    bottom: 92px;
+    z-index: 5;
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    background: var(--bg-3);
+    border: 1px solid var(--line);
+    color: var(--text);
+    display: grid;
+    place-items: center;
+    cursor: pointer;
+    box-shadow: 0 6px 18px #00000055;
+    transition: background 0.15s, transform 0.15s, border-color 0.15s;
+  }
+  .scroll-fab:hover {
+    background: var(--bg-hover);
+    border-color: var(--accent);
+    transform: translateY(-1px);
+  }
+  .fab-badge {
+    position: absolute;
+    top: -5px;
+    right: -5px;
+    min-width: 18px;
+    height: 18px;
+    padding: 0 5px;
+    border-radius: 9px;
+    background: var(--accent);
+    color: #fff;
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 18px;
+    text-align: center;
+    box-shadow: 0 0 0 2px var(--bg);
   }
   a.ghost:hover {
     color: var(--text);
@@ -1455,8 +1560,10 @@
     width: 34px;
     height: 34px;
     color: #fff;
-    font-size: 17px;
     flex: none;
+    display: grid;
+    place-items: center;
+    cursor: pointer;
   }
   .send:disabled {
     opacity: 0.4;
@@ -1470,6 +1577,11 @@
     padding: 11px;
     font-size: 14px;
     font-weight: 600;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    cursor: pointer;
   }
   .muted {
     color: var(--text-faint);
@@ -1612,6 +1724,17 @@
     .bar {
       padding: 12px 16px;
       gap: 8px;
+    }
+    /* Compact header on mobile: show icons only, drop the text labels. */
+    .ghost.ic span {
+      display: none;
+    }
+    .ghost.ic {
+      padding: 6px 8px;
+    }
+    .scroll-fab {
+      right: 20px;
+      bottom: 88px;
     }
     .hosts,
     .msg,
