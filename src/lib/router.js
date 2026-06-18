@@ -8,13 +8,11 @@ export function parseRoute(hash = '') {
   return hash.replace(/^#\/?/, '').toLowerCase();
 }
 
-// Map a route key to the top-level view. Prefix match, so 'app' and 'app/x'
-// both resolve to the chat view.
+// Map a route key to the top-level view: the exact 'app' route or any of its
+// sub-paths ('app/123') resolve to the chat view; everything else is landing.
 //
-// NOTE: this is a prefix match, so 'application' (or any 'app…' route) also
-// resolves to chat. That matches App.svelte's original `startsWith('app')`
-// behavior — preserved here deliberately. Tighten to an exact/segment match if
-// such routes ever exist (see App.svelte.test.js).
+// Segment-aware on purpose — a bare `startsWith('app')` would also match
+// unrelated routes like 'application' or 'apple'.
 export function isAppRoute(route) {
-  return route.startsWith('app');
+  return route === 'app' || route.startsWith('app/');
 }
