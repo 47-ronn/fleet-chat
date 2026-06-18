@@ -323,6 +323,24 @@ export class Relay {
     return res.result_type === 'transfer' ? res.status : null;
   }
 
+  // --- Cloudflare quick tunnels (expose a host's local port publicly) ---
+
+  // Start a quick tunnel; `target` is a local address ('http://localhost:3000')
+  // or a bare port ('3000'). Downloads cloudflared on demand → can take a while.
+  async tunnelStart(agentId, target) {
+    const res = await this.sendCommand(agentId, { cmd: 'tunnel_start', target }, 90000);
+    return res.result_type === 'tunnel_started' ? res.tunnel : null;
+  }
+
+  async tunnelList(agentId) {
+    const res = await this.sendCommand(agentId, { cmd: 'tunnel_list' }, 8000);
+    return res.result_type === 'tunnel_list' ? res.tunnels || [] : [];
+  }
+
+  async tunnelStop(agentId, id) {
+    await this.sendCommand(agentId, { cmd: 'tunnel_stop', id }, 8000);
+  }
+
   close() {
     if (this.ws) this.ws.close();
   }
