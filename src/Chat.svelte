@@ -455,7 +455,7 @@
         // provider session it creates.
         const host = answeringHost();
         if (!host) {
-          alert('No host in the fleet has an AI provider ✨. Start a node where claude/opencode is available.');
+          notify('No AI-provider host in the fleet ✨. Start a node where claude/opencode is available.', 'error');
           return;
         }
         const msg = text;
@@ -485,7 +485,7 @@
         // refresh will adopt it under "Dialogs".
       }
     } catch (err) {
-      alert('Failed to send: ' + (err.message || err));
+      notify('Failed to send: ' + (err.message || err), 'error');
     } finally {
       sending = false;
     }
@@ -524,6 +524,49 @@
     for (const m of text.matchAll(IMG_RE)) out.add((m[1] || m[2]).trim());
     return [...out];
   }
+
+  // Absolute file paths mentioned in a message (backtick-quoted or bare),
+  // excluding images (those get inline thumbnails). Rendered as download cards
+  // so "send me the file" attaches the actual file instead of pasting its text.
+  const FILE_RE =
+    /`((?:\/|~\/|[A-Za-z]:\\)[^`\n]+\.[A-Za-z0-9]{1,8})`|((?:\/|~\/|[A-Za-z]:\\)[^\s`*<>|"]+\.[A-Za-z0-9]{1,8})/g;
+  const IMG_EXT = /\.(?:png|jpe?g|gif|webp|bmp|svg)$/i;
+  function filePaths(text) {
+    if (!text) return [];
+    const out = new Set();
+    for (const m of text.matchAll(FILE_RE)) {
+      const p = (m[1] || m[2]).trim().replace(/[.,;:)]+$/, '');
+      if (!IMG_EXT.test(p)) out.add(p);
+    }
+    return [...out];
+  }
+
+  let copiedIdx = $state(-1);
+  async function copyMsg(text, idx) {
+    try {
+      await navigator.clipboard.writeText(text);
+      copiedIdx = idx;
+      setTimeout(() => {
+        if (copiedIdx === idx) copiedIdx = -1;
+      }, 1200);
+    } catch {
+      notify('Copy failed', 'error');
+    }
+  }
+
+  // --- toast notifications (replace blocking alert()) ---
+  let toasts = $state([]);
+  let toastSeq = 0;
+  function notify(message, type = 'error') {
+    const id = ++toastSeq;
+    toasts = [...toasts, { id, message, type }];
+    setTimeout(() => {
+      toasts = toasts.filter((t) => t.id !== id);
+    }, type === 'error' ? 6000 : 3500);
+  }
+  function dismissToast(id) {
+    toasts = toasts.filter((t) => t.id !== id);
+  }
   // The host whose filesystem a transcript message refers to.
   function msgHost(m) {
     return m.host || activeDialog?.host || pendingChat?.host || null;
@@ -548,18 +591,22 @@
     loadChatThumb(host, path);
   }
 
-  async function downloadChatImage(host, path) {
+  async function downloadChatFile(host, path) {
+    if (!host) {
+      notify('Unknown host for this file', 'error');
+      return;
+    }
     try {
       const meta = await relay.fileStat(host, path);
       const blob = await relay.downloadFile(host, path, { mime: meta?.mime, size: meta?.size });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = path.split(/[\\/]/).pop() || 'image';
+      a.download = path.split(/[\\/]/).pop() || 'file';
       a.click();
       setTimeout(() => URL.revokeObjectURL(url), 30000);
     } catch (e) {
-      alert('Failed to download: ' + (e.message || e));
+      notify('Failed to download: ' + (e.message || e), 'error');
     }
   }
 
@@ -569,7 +616,7 @@
       await relay.sessionTerminate(d.host, d.id);
       await refreshFleet();
     } catch (err) {
-      alert('Failed to end session: ' + (err.message || err));
+      notify('Failed to end session: ' + (err.message || err), 'error');
     }
   }
 
@@ -684,9 +731,18 @@
             Failed to load dialog: {transcriptError}
           </div></div>
         {/if}
-        {#each transcript as m}
+        {#each transcript as m, i}
           <div class="msg {m.role}">
-            <div class="bubble">{m.text || '…'}</div>
+            <div class="bubble">
+              {m.text || '…'}
+              {#if m.text}
+                <button
+                  class="copy-btn"
+                  title="Copy message"
+                  onclick={() => copyMsg(m.text, i)}
+                >{copiedIdx === i ? '✓' : '⧉'}</button>
+              {/if}
+            </div>
             {#each imagePaths(m.text) as p (p)}
               {@const host = msgHost(m)}
               {@const st = chatImgs[`${host}:${p}`]}
@@ -697,7 +753,7 @@
                   <button
                     class="img-btn"
                     title="Download original"
-                    onclick={() => downloadChatImage(host, p)}
+                    onclick={() => downloadChatFile(host, p)}
                   >
                     <img src={st.thumb} alt={p} />
                   </button>
@@ -706,6 +762,14 @@
                   <div class="bubble dim">⚠️ {p.split('/').pop()}: {st.error}</div>
                 {/if}
               </div>
+            {/each}
+            {#each filePaths(m.text) as p (p)}
+              {@const host = msgHost(m)}
+              <button class="file-card" title="Download file" onclick={() => downloadChatFile(host, p)}>
+                <span class="file-card-ic">📄</span>
+                <span class="file-card-name">{p.split(/[\\/]/).pop()}</span>
+                <span class="file-card-dl">Download</span>
+              </button>
             {/each}
           </div>
         {/each}
@@ -887,6 +951,15 @@
       </div>
     </div>
   {/if}
+
+  <!-- Toast notifications (replace blocking alert()) -->
+  <div class="toasts" aria-live="polite">
+    {#each toasts as t (t.id)}
+      <button class="toast {t.type}" onclick={() => dismissToast(t.id)} title="Dismiss">
+        {t.message}
+      </button>
+    {/each}
+  </div>
 {/if}
 
 <style>
@@ -1217,6 +1290,7 @@
     color: #9a9aa6;
   }
   .bubble {
+    position: relative;
     max-width: min(720px, 78%);
     padding: 12px 16px;
     border-radius: var(--radius);
@@ -1224,6 +1298,88 @@
     white-space: pre-wrap;
     word-wrap: break-word;
     font-size: 15px;
+  }
+  /* Copy-to-clipboard button, revealed on hover of a message. */
+  .copy-btn {
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    border: none;
+    background: var(--bg-3);
+    color: var(--text-dim);
+    border-radius: 6px;
+    width: 24px;
+    height: 24px;
+    font-size: 13px;
+    line-height: 1;
+    opacity: 0;
+    transition: opacity 0.12s;
+    cursor: pointer;
+  }
+  .bubble:hover .copy-btn {
+    opacity: 0.85;
+  }
+  .copy-btn:hover {
+    opacity: 1 !important;
+    color: var(--text);
+  }
+  /* Download card for a file path mentioned in a message. */
+  .file-card {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 6px;
+    padding: 8px 12px;
+    background: var(--bg-2);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    color: var(--text);
+    font-size: 14px;
+    cursor: pointer;
+    max-width: min(420px, 78%);
+  }
+  .file-card:hover {
+    border-color: var(--accent);
+  }
+  .file-card-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .file-card-dl {
+    margin-left: auto;
+    color: var(--accent);
+    font-weight: 600;
+    flex-shrink: 0;
+  }
+  /* Toast notifications. */
+  .toasts {
+    position: fixed;
+    bottom: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    z-index: 100;
+    max-width: min(560px, 92vw);
+  }
+  .toast {
+    text-align: left;
+    padding: 11px 16px;
+    border-radius: 10px;
+    font-size: 14px;
+    color: #fff;
+    border: none;
+    cursor: pointer;
+    box-shadow: 0 6px 24px #0006;
+    background: var(--bg-3);
+  }
+  .toast.error {
+    background: #b3323b;
+  }
+  .toast.success {
+    background: #2f7d4f;
   }
   .msg.user .bubble {
     background: var(--bubble-user);
