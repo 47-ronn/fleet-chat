@@ -175,6 +175,58 @@
     }
   }
 
+  // --- tunnels panel: expose a host's local port at a public URL ---
+  let showTunnels = $state(false);
+  let tunHost = $state(''); // selected executor agent id
+  let tunTarget = $state('3000'); // local port or address to expose
+  let tunnels = $state([]); // running tunnels on the selected host
+  let tunBusy = $state(false);
+  let tunErr = $state('');
+
+  function openTunnels() {
+    tunErr = '';
+    if (!tunHost || !executors.some((a) => a.id === tunHost)) {
+      tunHost = executors[0]?.id || '';
+    }
+    showTunnels = true;
+    refreshTunnels();
+  }
+
+  async function refreshTunnels() {
+    if (!relay || !tunHost) {
+      tunnels = [];
+      return;
+    }
+    try {
+      tunnels = await relay.tunnelList(tunHost);
+    } catch (e) {
+      tunErr = String(e?.message || e);
+    }
+  }
+
+  async function startTunnel() {
+    if (!relay || !tunHost || !tunTarget.trim()) return;
+    tunErr = '';
+    tunBusy = true;
+    try {
+      const t = await relay.tunnelStart(tunHost, tunTarget.trim());
+      if (t) tunnels = [...tunnels.filter((x) => x.id !== t.id), t];
+    } catch (e) {
+      tunErr = String(e?.message || e);
+    } finally {
+      tunBusy = false;
+    }
+  }
+
+  async function stopTunnel(id) {
+    try {
+      await relay.tunnelStop(tunHost, id);
+      tunnels = tunnels.filter((t) => t.id !== id);
+    } catch (e) {
+      tunErr = String(e?.message || e);
+    }
+  }
+
   // Pull the fleet's hosts, every provider session (history), and in-progress work.
   // `silent` skips the loading indicator (used by the background poll); concurrent
   // calls coalesce onto the in-flight refresh so a 5s poll can't stack up.
@@ -575,6 +627,7 @@
         {/if}
         <a class="ghost" href="#/" title="Home">← Home</a>
         <button class="ghost" onclick={() => (showFiles = true)}>📁 Files</button>
+        <button class="ghost" onclick={openTunnels} title="Tunnels">🌐 Tunnels</button>
         <button class="ghost" onclick={openSettings} title="Settings">⚙️</button>
         <button class="ghost" onclick={logout}>Log out</button>
         <button
@@ -782,6 +835,58 @@
       </form>
     </div>
   {/if}
+
+  {#if showTunnels}
+    <div class="files-overlay" onclick={(e) => { if (e.target === e.currentTarget) showTunnels = false; }}>
+      <div class="settings-modal tunnels-modal">
+        <header class="bar">
+          <strong>🌐 Quick tunnels</strong>
+          <button type="button" class="ghost" onclick={() => (showTunnels = false)}>✕ Close</button>
+        </header>
+        <div class="settings-body">
+          <label>Host</label>
+          <select bind:value={tunHost} onchange={refreshTunnels}>
+            {#each executors as a}
+              <option value={a.id}>{a.name}</option>
+            {/each}
+          </select>
+          <label>Local target (port or address)</label>
+          <div class="tun-start">
+            <input
+              bind:value={tunTarget}
+              placeholder="3000 or http://localhost:3000"
+              autocomplete="off"
+              onkeydown={(e) => { if (e.key === 'Enter') startTunnel(); }}
+            />
+            <button class="primary" onclick={startTunnel} disabled={tunBusy || !tunHost || !tunTarget.trim()}>
+              {tunBusy ? 'Starting…' : 'Start'}
+            </button>
+          </div>
+          <p class="hint">Exposes the host's local port at a public https://*.trycloudflare.com URL (downloads cloudflared on first use; host must be in edit/bypass mode).</p>
+          {#if tunErr}<div class="err">{tunErr}</div>{/if}
+
+          {#if tunnels.length}
+            <div class="tun-list">
+              {#each tunnels as t}
+                <div class="tun-row">
+                  <div class="tun-meta">
+                    <a href={t.public_url} target="_blank" rel="noopener" class="tun-url">{t.public_url}</a>
+                    <span class="muted">→ {t.target}</span>
+                  </div>
+                  <div class="tun-acts">
+                    <button class="ghost" title="Copy URL" onclick={() => navigator.clipboard?.writeText(t.public_url)}>📋</button>
+                    <button class="ghost danger" onclick={() => stopTunnel(t.id)}>Stop</button>
+                  </div>
+                </div>
+              {/each}
+            </div>
+          {:else}
+            <p class="muted tun-empty">No running tunnels on this host.</p>
+          {/if}
+        </div>
+      </div>
+    </div>
+  {/if}
 {/if}
 
 <style>
@@ -880,6 +985,85 @@
   .settings-actions .primary:disabled {
     opacity: 0.5;
     cursor: not-allowed;
+  }
+  .tunnels-modal {
+    width: min(560px, 100%);
+  }
+  .settings-body select {
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 10px 12px;
+    color: var(--text);
+    font-size: 14px;
+    outline: none;
+  }
+  .tun-start {
+    display: flex;
+    gap: 8px;
+  }
+  .tun-start input {
+    flex: 1;
+  }
+  .tun-start .primary {
+    background: var(--accent);
+    border: none;
+    border-radius: 10px;
+    padding: 0 18px;
+    color: #fff;
+    font-size: 14px;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .tun-start .primary:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .tun-list {
+    margin-top: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .tun-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 10px 12px;
+  }
+  .tun-meta {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+  .tun-url {
+    color: var(--accent);
+    font-size: 14px;
+    text-decoration: none;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .tun-url:hover {
+    text-decoration: underline;
+  }
+  .tun-meta .muted {
+    font-size: 12px;
+  }
+  .tun-acts {
+    display: flex;
+    gap: 6px;
+    flex-shrink: 0;
+  }
+  .tun-empty {
+    margin-top: 16px;
+    text-align: center;
+    font-size: 14px;
   }
   .main {
     display: flex;
