@@ -45,11 +45,10 @@ describe('isAppRoute', () => {
     expect(isAppRoute('about')).toBe(false);
   });
 
-  it('over-matches any "app"-prefixed route (documented sharp edge)', () => {
-    // Prefix match: 'application' resolves to the chat view too. This mirrors
-    // App.svelte's original behavior. If a real 'application' route is ever
-    // added, tighten isAppRoute to `route === 'app' || route.startsWith('app/')`.
-    expect(isAppRoute('application')).toBe(true);
-    expect(isAppRoute('apple')).toBe(true);
+  it('does NOT match unrelated "app"-prefixed routes', () => {
+    // Segment-aware: only 'app' / 'app/...' count, not 'application' or 'apple'.
+    expect(isAppRoute('application')).toBe(false);
+    expect(isAppRoute('apple')).toBe(false);
+    expect(isAppRoute('apps')).toBe(false);
   });
 });
