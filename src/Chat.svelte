@@ -803,11 +803,13 @@
             {/each}
             {#each filePaths(m.text) as p (p)}
               {@const host = msgHost(m)}
-              <button class="file-card" title="Download file" onclick={() => downloadChatFile(host, p)}>
-                <span class="file-card-ic">📄</span>
-                <span class="file-card-name">{p.split(/[\\/]/).pop()}</span>
-                <span class="file-card-dl">Download</span>
-              </button>
+              <div class="file-row">
+                <button class="file-card" title="Download file" onclick={() => downloadChatFile(host, p)}>
+                  <span class="file-card-ic">📄</span>
+                  <span class="file-card-name">{p.split(/[\\/]/).pop()}</span>
+                  <span class="file-card-dl">Download</span>
+                </button>
+              </div>
             {/each}
           </div>
         {/each}
@@ -1428,7 +1430,17 @@
     opacity: 1 !important;
     color: var(--text);
   }
-  /* Download card for a file path mentioned in a message. */
+  /* Each download card sits on its own full-width row below the bubble (like
+     .chat-img) so it never gets pulled beside the bubble and stretched by the
+     wrapping flex row. The row carries the 100% basis (no max-width, so it
+     genuinely forces a line break); the card keeps its own compact max-width. */
+  .file-row {
+    flex-basis: 100%;
+    display: flex;
+  }
+  .msg.user .file-row {
+    justify-content: flex-end;
+  }
   .file-card {
     display: inline-flex;
     align-items: center;
