@@ -2,11 +2,13 @@
 // (no agent_info → the peer-model relay registers it as an unlisted observer
 // that can list the room, send commands, and receive results routed back).
 //
-// Protocol mirror of crates/shared/src/protocol.rs:
-//   ClientMessage tag = "type" (snake_case); Command envelope tag = "cmd";
-//   CommandResult tag = "result_type". Command/result payloads are E2E-encrypted.
+// Protocol: binary protobuf (generated from proto/remote_agents.proto, see
+// ./wire.js). Command/result payloads are E2E-encrypted raw bytes; the inner
+// Command/CommandResult is still JSON (tag "cmd"/"result_type"), encrypted then
+// carried as the protobuf `payload`/`result` bytes.
 
-import { deriveKey, encryptStr, decryptStr } from './crypto.js';
+import { deriveKey, encryptBytes, decryptBytes } from './crypto.js';
+import { encodeClientMessage, decodeServerMessage } from './wire.js';
 
 let reqCounter = 0;
 const nextReqId = () => `web-${Date.now()}-${reqCounter++}`;
@@ -47,11 +49,12 @@ export class Relay {
     return new Promise((resolve, reject) => {
       const ws = new WebSocket(url);
       this.ws = ws;
+      ws.binaryType = 'arraybuffer'; // protocol is binary protobuf
       const timer = setTimeout(() => reject(new Error('connection timeout')), 10000);
 
       ws.onopen = () => {
         // Auth as an anonymous observer (no agent_info).
-        ws.send(JSON.stringify({ type: 'auth', room: this.room, token: this.token }));
+        ws.send(encodeClientMessage({ type: 'auth', room: this.room, token: this.token }));
       };
       ws.onerror = () => {
         clearTimeout(timer);
@@ -63,7 +66,7 @@ export class Relay {
       ws.onmessage = (ev) => {
         let msg;
         try {
-          msg = JSON.parse(ev.data);
+          msg = decodeServerMessage(new Uint8Array(ev.data));
         } catch {
           return;
         }
@@ -126,7 +129,7 @@ export class Relay {
   listAgents(timeoutMs = 5000) {
     return new Promise((resolve, reject) => {
       this.pendingList = resolve;
-      this.ws.send(JSON.stringify({ type: 'list_agents' }));
+      this.ws.send(encodeClientMessage({ type: 'list_agents' }));
       setTimeout(() => {
         if (this.pendingList) {
           this.pendingList = null;
@@ -139,11 +142,11 @@ export class Relay {
   // Send an encrypted command to a single agent and await its decrypted result.
   async sendCommand(agentId, command, timeoutMs = 30000) {
     const requestId = nextReqId();
-    const payload = await encryptStr(this.key, JSON.stringify(command));
+    const payload = await encryptBytes(this.key, JSON.stringify(command));
     const result = await new Promise((resolve, reject) => {
       this.pendingCmds.set(requestId, { resolve, reject });
       this.ws.send(
-        JSON.stringify({
+        encodeClientMessage({
           type: 'command',
           request_id: requestId,
           target: { type: 'agent', id: agentId },
@@ -157,7 +160,7 @@ export class Relay {
         }
       }, timeoutMs);
     });
-    return JSON.parse(await decryptStr(this.key, result));
+    return JSON.parse(await decryptBytes(this.key, result));
   }
 
   async taskList(agentId) {

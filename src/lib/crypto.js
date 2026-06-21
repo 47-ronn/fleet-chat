@@ -42,7 +42,10 @@ function b64decode(str) {
   return out;
 }
 
-export async function encryptStr(key, plaintext) {
+// Raw envelope `nonce(12) || ciphertext || tag(16)` as bytes — the binary-wire
+// form (matches Rust `Cipher::encrypt_bytes`). No base64: the protobuf `payload`
+// field carries these bytes directly.
+export async function encryptBytes(key, plaintext) {
   const nonce = crypto.getRandomValues(new Uint8Array(12));
   const ct = new Uint8Array(
     await crypto.subtle.encrypt({ name: 'AES-GCM', iv: nonce }, key, enc.encode(plaintext))
@@ -50,15 +53,26 @@ export async function encryptStr(key, plaintext) {
   const combined = new Uint8Array(nonce.length + ct.length);
   combined.set(nonce, 0);
   combined.set(ct, nonce.length);
-  return b64encode(combined);
+  return combined;
 }
 
-export async function decryptStr(key, encoded) {
-  const data = b64decode(encoded);
+// Decrypt a raw envelope produced by `encryptBytes` / Rust `encrypt_bytes`
+// (matches Rust `decrypt_bytes`); zstd-decompresses the plaintext if needed.
+export async function decryptBytes(key, data) {
   const nonce = data.slice(0, 12);
   const ct = data.slice(12);
   const ptBuf = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: nonce }, key, ct);
   let pt = new Uint8Array(ptBuf);
   if (isZstd(pt)) pt = zstdDecompress(pt);
   return dec.decode(pt);
+}
+
+// Base64 string forms (kept for any text-transport callers); wrap the byte
+// versions so the crypto lives in one place.
+export async function encryptStr(key, plaintext) {
+  return b64encode(await encryptBytes(key, plaintext));
+}
+
+export async function decryptStr(key, encoded) {
+  return decryptBytes(key, b64decode(encoded));
 }
