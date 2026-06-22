@@ -506,6 +506,11 @@
         const taskId = await relay.taskDispatch(host, msg);
         const reply = await pollTask(host, taskId);
         if (reply != null) transcript = [...transcript, { role: 'assistant', text: reply, host }];
+        // The reply is in — stop the "typing…" indicator now. The session
+        // adoption below is background housekeeping (it can take seconds to many
+        // refreshes if the host is slow to surface the new session) and must NOT
+        // keep the indicator/composer locked.
+        sending = false;
         // Adopt the newly-created provider session so the NEXT message resumes
         // it (conversation context). The host drops its session-list cache on
         // task finish, so it appears quickly; retry a few times for scan lag.
