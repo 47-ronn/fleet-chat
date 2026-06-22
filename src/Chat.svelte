@@ -35,6 +35,39 @@
   // A freshly-started chat that has no provider session yet — owns the
   // transcript locally until the host materializes the session.
   let pendingChat = $state(null); // {host, hostName} | null
+  let copiedId = $state(false); // brief ✓ feedback after copying the session id
+
+  // Copy the selected session's id to the clipboard, with a short ✓ flip.
+  async function copySessionId(id) {
+    if (!id) return;
+    try {
+      await navigator.clipboard.writeText(id);
+      copiedId = true;
+      setTimeout(() => (copiedId = false), 1200);
+    } catch {
+      notify('Copy failed (clipboard unavailable)', 'error');
+    }
+  }
+
+  // Dialogs filter: which providers (claude / opencode / cline / …) to show in
+  // the chat list (empty = all). Set via the right-click context menu on the list.
+  let providerFilter = $state(new Set());
+  let hostMenu = $state(null); // {x, y} context-menu anchor, or null
+
+  function openHostMenu(e) {
+    e.preventDefault();
+    hostMenu = { x: e.clientX, y: e.clientY };
+  }
+  function toggleProvider(p) {
+    const next = new Set(providerFilter);
+    if (next.has(p)) next.delete(p);
+    else next.add(p);
+    providerFilter = next; // reassign so $derived recomputes
+  }
+  function clearProviderFilter() {
+    providerFilter = new Set();
+    hostMenu = null;
+  }
 
   // Pinned dialogs (client-side only — the fleet protocol has no pin flag).
   // Persisted per-room so different rooms keep separate pins.
@@ -66,6 +99,18 @@
     [...dialogs].sort(
       (a, b) => (pinned.has(b.key) ? 1 : 0) - (pinned.has(a.key) ? 1 : 0)
     )
+  );
+
+  // Providers (claude / opencode / cline / roo / kilo) present in the fleet's
+  // history — the choices for the filter menu, with a per-provider count.
+  const filterProviders = $derived(
+    [...dialogs.reduce((m, d) => m.set(d.provider, (m.get(d.provider) || 0) + 1), new Map())]
+      .map(([provider, count]) => ({ provider, count }))
+      .sort((a, b) => a.provider.localeCompare(b.provider))
+  );
+  // Apply the provider filter (empty filter = show everything).
+  const visibleDialogs = $derived(
+    providerFilter.size ? sortedDialogs.filter((d) => providerFilter.has(d.provider)) : sortedDialogs
   );
 
   // Grow the composer to fit its content (capped by CSS max-height). Re-runs
@@ -698,7 +743,17 @@
     <section class="chat">
       <header class="bar">
         <div class="bar-left">
-          <strong>{activeDialog ? activeDialog.title : 'New chat'}</strong>
+          <span class="title-row">
+            <strong>{activeDialog ? activeDialog.title : 'New chat'}</strong>
+            {#if activeDialog}
+              <button
+                class="copy-id"
+                title={copiedId ? 'Copied!' : `Copy session id (${activeDialog.id})`}
+                aria-label="Copy session id"
+                onclick={() => copySessionId(activeDialog.id)}
+              ><Icon name={copiedId ? 'check' : 'copy'} size={14} draw={false} /></button>
+            {/if}
+          </span>
           <span class="hosts-count">
             {#if activeDialog}
               {activeDialog.provider} · {activeDialog.hostName}
@@ -885,9 +940,15 @@
         </div>
       {/if}
 
-      <div class="sec-title">Dialogs {#if loading}<span class="muted">· loading…</span>{/if}</div>
+      <div class="sec-title" oncontextmenu={openHostMenu} title="Right-click to filter by provider">
+        Dialogs
+        {#if loading}<span class="muted">· loading…</span>{/if}
+        {#if providerFilter.size}<span class="muted">· {[...providerFilter].join(', ')} ⏷</span>{/if}
+      </div>
       {#if !loading && dialogs.length === 0}
         <div class="muted">No claude/opencode history found in the fleet</div>
+      {:else if !loading && visibleDialogs.length === 0}
+        <div class="muted">No history from the selected provider(s) · right-click to change</div>
       {/if}
       {#each hostErrors as he}
         <div class="host-err" title={he.error}>
@@ -895,8 +956,8 @@
           {#if /decrypt|key/i.test(he.error)}<span class="muted"> — node is on a different token/key (or a stale socket is stuck under the same agent-id)</span>{/if}
         </div>
       {/each}
-      <div class="list">
-        {#each sortedDialogs as d}
+      <div class="list" oncontextmenu={openHostMenu}>
+        {#each visibleDialogs as d}
           <div class="item" class:on={d.key === active}>
             <button class="item-open" onclick={() => openDialog(d)}>
               <span class="item-title">
@@ -917,6 +978,26 @@
         {/each}
       </div>
     </aside>
+
+    {#if hostMenu}
+      <button class="ctx-backdrop" aria-label="Close menu" onclick={() => (hostMenu = null)}></button>
+      <div class="ctx-menu" style="left:{hostMenu.x}px; top:{hostMenu.y}px" role="menu">
+        <div class="ctx-head">Show providers</div>
+        <button class="ctx-item" role="menuitemcheckbox" aria-checked={providerFilter.size === 0} onclick={clearProviderFilter}>
+          <span class="ctx-check">{providerFilter.size === 0 ? '✓' : ''}</span> All providers
+        </button>
+        {#each filterProviders as p}
+          <button class="ctx-item" role="menuitemcheckbox" aria-checked={providerFilter.has(p.provider)} onclick={() => toggleProvider(p.provider)}>
+            <span class="ctx-check">{providerFilter.has(p.provider) ? '✓' : ''}</span>
+            <span class="ctx-name prov {p.provider}">{p.provider}</span>
+            <span class="ctx-dim">{p.count}</span>
+          </button>
+        {/each}
+        {#if filterProviders.length === 0}
+          <div class="ctx-head">no history yet</div>
+        {/if}
+      </div>
+    {/if}
   </div>
 
   {#if showFiles}
@@ -1237,6 +1318,88 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    min-width: 0;
+  }
+  .title-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+  }
+  .copy-id {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 2px;
+    background: none;
+    border: none;
+    border-radius: 4px;
+    color: var(--text-dim);
+    cursor: pointer;
+  }
+  .copy-id:hover {
+    color: var(--text);
+    background: var(--line);
+  }
+  .ctx-backdrop {
+    position: fixed;
+    inset: 0;
+    background: transparent;
+    border: none;
+    padding: 0;
+    z-index: 60;
+    cursor: default;
+  }
+  .ctx-menu {
+    position: fixed;
+    z-index: 61;
+    min-width: 190px;
+    max-height: 340px;
+    overflow: auto;
+    padding: 6px;
+    background: var(--bg-2);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+  }
+  .ctx-head {
+    font-size: 11px;
+    color: var(--text-dim);
+    padding: 4px 8px;
+  }
+  .ctx-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    text-align: left;
+    background: none;
+    border: none;
+    color: var(--text);
+    padding: 7px 8px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+  }
+  .ctx-item:hover {
+    background: var(--bg-hover);
+  }
+  .ctx-check {
+    width: 12px;
+    flex: none;
+    color: var(--accent);
+  }
+  .ctx-name {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .ctx-dim {
+    flex: none;
+    font-size: 11px;
+    color: var(--text-dim);
   }
   .hosts-count {
     font-size: 12px;

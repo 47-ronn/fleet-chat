@@ -50,6 +50,11 @@
   {:else if name === 'home'}
     <path pathLength="1" d="M3 11l9-8 9 8" />
     <path pathLength="1" d="M5 10v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V10" />
+  {:else if name === 'copy'}
+    <path pathLength="1" d="M9 9h9a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H9a1 1 0 0 1-1-1v-9a1 1 0 0 1 1-1z" />
+    <path pathLength="1" d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+  {:else if name === 'check'}
+    <path pathLength="1" d="M5 12l4 4L19 7" />
   {/if}
 </svg>
 
