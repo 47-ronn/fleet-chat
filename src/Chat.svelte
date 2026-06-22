@@ -175,6 +175,7 @@
     const r = new Relay(relayUrl, roomName, token);
     r.onAgentChange = onAgentChange;
     r.onEvent = () => scheduleRefresh(); // task_completed etc. → reconcile
+    r.onReconnect = () => scheduleRefresh(); // re-fetch after a transparent re-dial
     await r.connect(); // throws on bad creds → nothing is stored below
     relay = r;
     room = roomName;
@@ -202,6 +203,7 @@
     const r = new Relay(relayUrl, roomName, token);
     r.onAgentChange = onAgentChange;
     r.onEvent = () => scheduleRefresh();
+    r.onReconnect = () => scheduleRefresh();
     await r.connect();
     relay = r;
     room = roomName;
@@ -359,7 +361,7 @@
           // means this host runs on a different token/key (or a stale socket
           // shares its agent-id) — otherwise the user just sees "no history".
           const msg = String(e?.message || e);
-          if (!/timed out/i.test(msg)) he.push({ hostName: a.name, error: msg });
+          if (!/timed out|disconnected/i.test(msg)) he.push({ hostName: a.name, error: msg });
         }
         try {
           for (const t of await relay.taskList(a.id)) {
@@ -414,7 +416,13 @@
 
   async function pollFleet() {
     if (!relay || !authed) return;
-    await refreshFleet({ silent: true });
+    // A poll landing mid-reconnect rejects with 'disconnected'; ignore it and
+    // let the next tick (or the onReconnect refresh) recover.
+    try {
+      await refreshFleet({ silent: true });
+    } catch {
+      return;
+    }
     // A live session is being driven on the host — pull any new turns so the
     // open chat updates as the user writes to it there.
     const d = activeDialog;

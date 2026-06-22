@@ -31,8 +31,17 @@ export class Relay {
     this.key = null;
     this.sessionId = null;
     this.pendingCmds = new Map(); // request_id -> { resolve, reject }
-    this.pendingList = null; // resolver for the next agent_list
+    this.pendingList = null; // { resolve, reject } for the next agent_list
     this.onError = () => {};
+    // Keepalive + auto-reconnect: the relay reaps idle sockets (~90s), so we
+    // ping periodically and transparently re-dial after an unexpected close.
+    this.pingTimer = null;
+    this.reconnectTimer = null;
+    this.reconnectDelay = 1000;
+    this.everConnected = false;
+    this.intentionalClose = false;
+    // Fired after a transparent reconnect re-auths, so the UI can re-fetch.
+    this.onReconnect = () => {};
     // Push notifications from the relay so the UI can react live (no polling):
     //   onAgentChange({kind:'joined'|'left'|'mode', agent?, id?, mode?})
     //   onEvent(msg)  — an agent's unsolicited event (e.g. task_completed)
@@ -42,6 +51,12 @@ export class Relay {
 
   async connect() {
     this.key = await deriveKey(this.token, this.overrideKey);
+    return this._open();
+  }
+
+  // Open the socket and complete the auth handshake; resolves with the session
+  // id. Used for both the initial connect and each reconnect attempt.
+  _open() {
     const url = `${this.relayUrl}/ws/room/${encodeURIComponent(
       this.room
     )}?token=${encodeURIComponent(this.token)}`;
@@ -50,7 +65,10 @@ export class Relay {
       const ws = new WebSocket(url);
       this.ws = ws;
       ws.binaryType = 'arraybuffer'; // protocol is binary protobuf
-      const timer = setTimeout(() => reject(new Error('connection timeout')), 10000);
+      const timer = setTimeout(() => {
+        try { ws.close(); } catch {}
+        reject(new Error('connection timeout'));
+      }, 10000);
 
       ws.onopen = () => {
         // Auth as an anonymous observer (no agent_info).
@@ -61,7 +79,15 @@ export class Relay {
         reject(new Error('websocket error (check relay URL / network)'));
       };
       ws.onclose = () => {
+        clearTimeout(timer);
+        this._stopPing();
+        // In-flight requests can never complete on a dead socket — reject them
+        // now so callers retry on the next poll instead of waiting to time out.
+        this._failPending(new Error('disconnected'));
         this.onError(new Error('connection closed'));
+        // Re-dial only after a previously healthy connect, so a bad initial
+        // token/URL surfaces as an error instead of looping silently.
+        if (this.everConnected && !this.intentionalClose) this._scheduleReconnect();
       };
       ws.onmessage = (ev) => {
         let msg;
@@ -73,6 +99,9 @@ export class Relay {
         if (msg.type === 'auth_ok') {
           this.sessionId = msg.session_id;
           clearTimeout(timer);
+          this.everConnected = true;
+          this.reconnectDelay = 1000; // reset backoff on a healthy connect
+          this._startPing();
           resolve(this.sessionId);
           return;
         }
@@ -86,11 +115,47 @@ export class Relay {
     });
   }
 
+  _startPing() {
+    this._stopPing();
+    this.pingTimer = setInterval(() => {
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        try { this.ws.send(encodeClientMessage({ type: 'ping' })); } catch {}
+      }
+    }, 25000);
+  }
+
+  _stopPing() {
+    if (this.pingTimer) {
+      clearInterval(this.pingTimer);
+      this.pingTimer = null;
+    }
+  }
+
+  _scheduleReconnect() {
+    if (this.reconnectTimer || this.intentionalClose) return;
+    const delay = this.reconnectDelay;
+    this.reconnectDelay = Math.min(this.reconnectDelay * 2, 15000); // capped backoff
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      // A failed attempt closes its own socket → onclose schedules the next try.
+      this._open().then(() => this.onReconnect(this.sessionId), () => {});
+    }, delay);
+  }
+
+  _failPending(err) {
+    for (const [, p] of this.pendingCmds) p.reject(err);
+    this.pendingCmds.clear();
+    if (this.pendingList) {
+      this.pendingList.reject(err);
+      this.pendingList = null;
+    }
+  }
+
   _dispatch(msg) {
     switch (msg.type) {
       case 'agent_list':
         if (this.pendingList) {
-          this.pendingList(msg.agents || []);
+          this.pendingList.resolve(msg.agents || []);
           this.pendingList = null;
         }
         break;
@@ -128,7 +193,7 @@ export class Relay {
 
   listAgents(timeoutMs = 5000) {
     return new Promise((resolve, reject) => {
-      this.pendingList = resolve;
+      this.pendingList = { resolve, reject };
       this.ws.send(encodeClientMessage({ type: 'list_agents' }));
       setTimeout(() => {
         if (this.pendingList) {
@@ -345,6 +410,12 @@ export class Relay {
   }
 
   close() {
+    this.intentionalClose = true;
+    this._stopPing();
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     if (this.ws) this.ws.close();
   }
 }
