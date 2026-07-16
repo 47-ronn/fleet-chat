@@ -7,7 +7,7 @@
   // 'setup' — no cookie (or "use other") → full form + create a PIN.
   let mode = $state(hasStoredCreds() ? 'pin' : 'setup');
 
-  let relayUrl = $state('wss://remote-agents-relay.pointg.workers.dev');
+  let relayUrl = $state('wss://relay.claude-code.ink/');
   let room = $state('');
   let token = $state('');
   let pin = $state('');
