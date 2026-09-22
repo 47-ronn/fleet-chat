@@ -54,6 +54,83 @@
   let providerFilter = $state(new Set());
   let hostMenu = $state(null); // {x, y} context-menu anchor, or null
 
+  // --- Fleet-wide full-text search over the chat history ---------------------
+  // Fans `session_search` out to every executor host (each answers from its
+  // local BM25 index), merges hits by score, and jumps to the cited context
+  // (session_get window around the hit) on click.
+  let searchQuery = $state('');
+  let searching = $state(false);
+  let searchHits = $state([]); // {…SessionSearchHit, host, hostName}
+  let searchNote = $state(null);
+
+  async function runSearch() {
+    const q = searchQuery.trim();
+    if (!q || !relay || searching) return;
+    searching = true;
+    searchNote = null;
+    try {
+      const providers = providerFilter.size ? [...providerFilter] : [];
+      const hosts = executors;
+      const results = await Promise.allSettled(
+        hosts.map((a) => relay.sessionSearch(a.id, q, providers, 20))
+      );
+      const hits = [];
+      let failed = 0;
+      results.forEach((r, i) => {
+        if (r.status === 'fulfilled') {
+          for (const h of r.value || []) {
+            hits.push({ ...h, host: hosts[i].id, hostName: hosts[i].name });
+          }
+        } else {
+          failed++;
+        }
+      });
+      hits.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+      searchHits = hits;
+      searchNote = hits.length
+        ? failed
+          ? `${failed} host(s) failed to answer`
+          : null
+        : failed
+          ? `Nothing found (${failed} host(s) failed)`
+          : 'Nothing found — try other terms, or ask a host AI';
+    } finally {
+      searching = false;
+    }
+  }
+
+  function clearSearch() {
+    searchQuery = '';
+    searchHits = [];
+    searchNote = null;
+  }
+
+  // Open a search hit: adopt (or synthesize) its dialog, then load the cited
+  // context window instead of the whole transcript and center it.
+  function openSearchHit(h) {
+    const key = `${h.host}:${h.provider}:${h.session_id}`;
+    let d = dialogs.find((x) => x.key === key);
+    if (!d) {
+      d = {
+        key,
+        host: h.host,
+        hostName: h.hostName,
+        provider: h.provider,
+        id: h.session_id,
+        title: h.title || h.session_id,
+        updated: h.ts || 0,
+        cwd: h.cwd || null,
+        live: false,
+        resumable: ['claude', 'opencode', 'codex'].includes(h.provider),
+      };
+      dialogs = [d, ...dialogs];
+    }
+    active = key;
+    pendingChat = null;
+    sidebarOpen = false;
+    loadTranscript(d, { force: true, aroundSeq: h.seq });
+  }
+
   function openHostMenu(e) {
     e.preventDefault();
     hostMenu = { x: e.clientX, y: e.clientY };
@@ -436,8 +513,9 @@
   let loadedKey = null;
 
   // Fetch a dialog's transcript. `force` reloads in place (no spinner/clear),
-  // used by the poll to pull new turns of a live session.
-  async function loadTranscript(d, { force = false } = {}) {
+  // used by the poll to pull new turns of a live session. `aroundSeq` loads
+  // the cited window around that message (from a search hit) and centers it.
+  async function loadTranscript(d, { force = false, aroundSeq = null } = {}) {
     if (!d || !relay) return;
     if (!force && d.key === loadedKey) return; // already loaded this dialog
     loadedKey = d.key;
@@ -448,10 +526,25 @@
       transcript = [];
     }
     try {
-      const msgs = await relay.sessionGet(d.host, d.provider, d.id);
+      const msgs = await relay.sessionGet(
+        d.host,
+        d.provider,
+        d.id,
+        aroundSeq,
+        aroundSeq !== null ? 12 : null
+      );
       if (active === key) {
         transcript = msgs;
         transcriptError = null;
+        if (aroundSeq !== null) {
+          // The window is centered on the cited message — bring the middle of
+          // the transcript into view once it renders.
+          requestAnimationFrame(() => {
+            if (!messagesEl) return;
+            messagesEl.scrollTop =
+              messagesEl.scrollHeight / 2 - messagesEl.clientHeight / 2;
+          });
+        }
       }
     } catch (e) {
       // Surface the failure instead of leaving the pane blank (which read as
@@ -936,6 +1029,43 @@
     <aside class="sidebar" class:open={sidebarOpen}>
       <button class="new" onclick={newChat}><Icon name="plus" size={16} /><span>New chat</span></button>
 
+      <div class="search-box">
+        <input
+          bind:value={searchQuery}
+          placeholder="Search all dialogs…"
+          title="Full-text search over every host's AI-chat history"
+          onkeydown={(e) => e.key === 'Enter' && runSearch()}
+        />
+        {#if searchQuery || searchHits.length || searchNote}
+          <button class="search-clear" aria-label="Clear search" onclick={clearSearch}>✕</button>
+        {:else}
+          <button class="search-go" aria-label="Search" onclick={runSearch} disabled={searching || !searchQuery.trim()}>🔍</button>
+        {/if}
+      </div>
+      {#if searching}
+        <div class="muted">Searching the fleet… (first search may build the index)</div>
+      {:else if searchHits.length}
+        <div class="sec-title search-head">
+          Found: {searchHits.length}
+          {#if providerFilter.size}<span class="muted">· {[...providerFilter].join(', ')}</span>{/if}
+        </div>
+        <div class="list">
+          {#each searchHits as h (h.host + ':' + h.provider + ':' + h.session_id)}
+            <button class="item hit" onclick={() => openSearchHit(h)}>
+              <span class="item-title">{h.title}</span>
+              <span class="item-meta">
+                <span class="prov {h.provider}">{h.provider}</span> · {h.hostName}
+                · {h.match_count} match{h.match_count === 1 ? '' : 'es'}
+                · {(h.score ?? 0).toFixed(2)}
+              </span>
+              <span class="hit-snippet">{h.snippet}</span>
+            </button>
+          {/each}
+        </div>
+      {:else if searchNote}
+        <div class="muted">{searchNote}</div>
+      {/if}
+
       {#if inProgress.length > 0}
         <div class="sec-title">In progress</div>
         <div class="list">
@@ -954,7 +1084,7 @@
         {#if providerFilter.size}<span class="muted">· {[...providerFilter].join(', ')} ⏷</span>{/if}
       </div>
       {#if !loading && dialogs.length === 0}
-        <div class="muted">No claude/opencode history found in the fleet</div>
+        <div class="muted">No AI-chat history found in the fleet</div>
       {:else if !loading && visibleDialogs.length === 0}
         <div class="muted">No history from the selected provider(s) · right-click to change</div>
       {/if}
@@ -1858,6 +1988,79 @@
     color: var(--text-faint);
     margin: 8px 4px 2px;
   }
+
+  /* --- Fleet-wide dialog search --- */
+  .search-box {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    background: var(--bg-3);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 3px 6px 3px 12px;
+    margin-top: 8px;
+  }
+  .search-box input {
+    flex: 1;
+    min-width: 0;
+    background: transparent;
+    border: none;
+    outline: none;
+    color: var(--text);
+    font-size: 13.5px;
+    padding: 7px 0;
+  }
+  .search-box input::placeholder {
+    color: var(--text-faint);
+  }
+  .search-go,
+  .search-clear {
+    background: transparent;
+    border: none;
+    padding: 6px 7px;
+    font-size: 13px;
+    cursor: pointer;
+    border-radius: 7px;
+    flex: none;
+  }
+  .search-go:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+  }
+  .search-go:hover:not(:disabled),
+  .search-clear:hover {
+    background: var(--bg-hover);
+  }
+  .search-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .item.hit {
+    width: 100%;
+    background: transparent;
+    border: none;
+    padding: 9px 11px;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 3px;
+    text-align: left;
+    cursor: pointer;
+    border-radius: 9px;
+  }
+  .item.hit:hover {
+    background: var(--bg-hover);
+  }
+  .hit-snippet {
+    font-size: 12px;
+    color: var(--text-dim, var(--text-faint));
+    line-height: 1.45;
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
   .item.progress {
     cursor: default;
     opacity: 0.92;
@@ -1885,6 +2088,20 @@
   }
   .prov.zed {
     color: #7fd6ff;
+  }
+  .prov.cursor {
+    color: #d6d6d6;
+  }
+  .prov.codex {
+    color: #b8e986;
+  }
+  .prov.gemini,
+  .prov.qwen {
+    color: #9ab8ff;
+  }
+  .prov.goose,
+  .prov.continue {
+    color: #d6b8ff;
   }
   .live-tag {
     color: #5ad17f;

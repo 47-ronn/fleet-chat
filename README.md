@@ -21,6 +21,10 @@ host's AI delegate sub-tasks to specific peers.
   (Web Crypto, AES-256-GCM, key = `SHA-256("remote-agents/v1:" + roomToken)`),
   byte-for-byte compatible with the Rust `Cipher`.
 - Dialogs = each host's autonomous tasks (`task_list`); sending = `task_dispatch`.
+- The dialog sidebar has a **fleet-wide full-text search** (🔍): every host
+  answers from its local BM25 index of provider transcripts
+  (`session_search`), hits merge by score, and a click opens the cited
+  context window (`session_get { around_seq }`).
 
 ## Run
 

@@ -260,13 +260,23 @@ export class Relay {
     return { sessions: res.sessions || [], active: res.active || [] };
   }
 
-  async sessionGet(agentId, provider, id) {
+  async sessionGet(agentId, provider, id, aroundSeq = null, window = null) {
+    const cmd = { cmd: 'session_get', provider, id };
+    if (aroundSeq !== null && aroundSeq !== undefined) cmd.around_seq = aroundSeq;
+    if (window !== null && window !== undefined) cmd.window = window;
+    const res = await this.sendCommand(agentId, cmd, 20000);
+    return res.result_type === 'session_transcript' ? res.messages || [] : [];
+  }
+
+  // Full-text search over a host's indexed chat history (BM25, ranked
+  // snippets). providers = e.g. ['claude', 'opencode']; empty = all.
+  async sessionSearch(agentId, query, providers = [], limit = 20) {
     const res = await this.sendCommand(
       agentId,
-      { cmd: 'session_get', provider, id },
-      20000
+      { cmd: 'session_search', query, providers, limit },
+      120000 // first call may pay a one-time index build on the host
     );
-    return res.result_type === 'session_transcript' ? res.messages || [] : [];
+    return res.result_type === 'session_search' ? res.hits || [] : [];
   }
 
   async sessionResume(agentId, provider, id, prompt) {
