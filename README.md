@@ -41,6 +41,20 @@ Log in with the relay URL, room name, and the room token (e.g.
 
 - Multi-turn: each message currently creates one autonomous task (one
   prompt → one result); threading several turns into a task chain is a TODO.
+- **Live-session parallel write:** a dialog that is live on its host (a human
+  or agent drives it there) can now ALSO be written to from the web — each
+  message spawns its own headless resume (`claude -p --resume` /
+  `opencode run -s`) writing into the same session store. Turns may interleave;
+  that is the debugging trade-off (🟡 badge in the header).
+- **Agent graph** (🕸 button): nodes = fleet hosts + a virtual `🌐 browser`
+  node; edges = autonomous tasks aggregated consumer → executor (from each
+  task's `initiator`), colored by status (running/queued/done/failed). Click a
+  node to list its tasks split by role: executes (executor), ordered on peers
+  (consumer), or sub-agent (executes only, never orders).
+- **Chains (⛓):** after sending a new-chat task, the ⛓ button arms a
+  follow-up — when the source task finishes, the panel dispatches your prompt
+  to a chosen host with the previous result as context. Chains persist in
+  localStorage per room; the sidebar shows waiting/fired chains.
 - The AI provider token lives **on the answering host** (its autonomous runner),
   never in the browser — the browser only sends the prompt.
 - Result is polled via `task_get` until the host marks the task done/failed.

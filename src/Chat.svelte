@@ -2,12 +2,14 @@
   import { Relay } from './lib/relay.js';
   import Auth from './lib/Auth.svelte';
   import Files from './lib/Files.svelte';
+  import FleetGraph from './lib/FleetGraph.svelte';
   import Icon from './lib/Icon.svelte';
   import { scale } from 'svelte/transition';
   import { storeCreds, clearCreds } from './lib/creds.js';
 
   let relay = $state(null);
   let showFiles = $state(false); // file-browser overlay visibility
+  let showGraph = $state(false); // agent dependency-graph overlay
   let showSettings = $state(false); // credentials/settings overlay
   // Current connection credentials (for the settings form). The PIN is kept in
   // memory only for re-encrypting on a settings change — never persisted.
@@ -21,6 +23,9 @@
   let hostErrors = $state([]);
   // In-progress work: {host, hostName, kind:'task'|'cron', label, detail}
   let inProgress = $state([]);
+  // Per-host autonomous tasks for the dependency graph:
+  // [{host, hostName, tasks: [{id, initiator, prompt, status, created_at, …}]}]
+  let fleetTasks = $state([]);
   let active = $state(null); // selected dialog key, or null = new chat
   let selected = $state(new Set()); // agent ids addressed in the composer
   let input = $state('');
@@ -36,6 +41,8 @@
   // transcript locally until the host materializes the session.
   let pendingChat = $state(null); // {host, hostName} | null
   let copiedId = $state(false); // brief ✓ feedback after copying the session id
+  // The most recent dispatched task (new-chat path), for "Then…" chaining.
+  let lastDispatch = $state(null); // {host, taskId} | null
 
   // Copy the selected session's id to the clipboard, with a short ✓ flip.
   async function copySessionId(id) {
@@ -264,6 +271,7 @@
       await storeCreds(pin, creds);
     }
     loadPinned();
+    loadChains();
     authed = true;
     await refreshFleet();
     clearInterval(pollTimer);
@@ -402,6 +410,7 @@
       const dl = [];
       const ip = [];
       const he = [];
+      const ft = [];
       // Warn about machines with several live connections under one agent-id:
       // a wrong-keyed/stale socket among them can hijack routing (key mismatch).
       for (const a of agents) {
@@ -441,7 +450,9 @@
           if (!/timed out|disconnected/i.test(msg)) he.push({ hostName: a.name, error: msg });
         }
         try {
-          for (const t of await relay.taskList(a.id)) {
+          const ts = await relay.taskList(a.id);
+          ft.push({ host: a.id, hostName: a.name, tasks: ts });
+          for (const t of ts) {
             if (t.status === 'running') {
               ip.push({ host: a.id, hostName: a.name, kind: 'task', label: (t.prompt || t.id).slice(0, 60), detail: 'running' });
             }
@@ -457,6 +468,7 @@
       dialogs = dl;
       inProgress = ip;
       hostErrors = he;
+      fleetTasks = ft;
       } finally {
         if (!silent) loading = false;
         refreshInflight = null;
@@ -500,6 +512,8 @@
     } catch {
       return;
     }
+    // Fire any chains whose source task has finished.
+    if (chains.some((c) => !c.fired)) runChains();
     // A live session is being driven on the host — pull any new turns so the
     // open chat updates as the user writes to it there.
     const d = activeDialog;
@@ -612,12 +626,13 @@
     return aiHosts[0]?.id || null;
   }
 
-  // Composer is locked when the open dialog can't be continued from web: a live
-  // session (a human drives it on the host) or a view-only VS Code agent
-  // (cline/roo/kilo — no headless resume).
-  const composerLocked = $derived(
-    !!activeDialog && (activeDialog.live || activeDialog.resumable === false)
-  );
+  // Composer is locked ONLY for view-only providers (cline/roo/kilo — no
+  // headless resume). A session that is live on the host CAN now be written to
+  // in parallel-debug mode: each message spawns its own headless resume
+  // (`claude -p --resume` / `opencode run -s`) writing into the same session
+  // store (JSONL/SQLite) while the interactive process keeps running. Context
+  // may interleave — that's the debugging trade-off.
+  const composerLocked = $derived(!!activeDialog && activeDialog.resumable === false);
   const canSend = $derived(activeDialog ? !composerLocked : aiHosts.length > 0);
 
   async function send() {
@@ -650,6 +665,7 @@
         pendingChat = { host, hostName };
         transcript = [{ role: 'user', text: msg }];
         const taskId = await relay.taskDispatch(host, msg);
+        lastDispatch = taskId ? { host, taskId } : null;
         const reply = await pollTask(host, taskId);
         if (reply != null) transcript = [...transcript, { role: 'assistant', text: reply, host }];
         // The reply is in — stop the "typing…" indicator now. The session
@@ -696,6 +712,103 @@
       if (task.status === 'failed') return '⚠️ ' + (task.error || 'error');
     }
     return '⏱️ timed out waiting for a reply';
+  }
+
+  // --- Task chains: "when this task finishes, dispatch a follow-up agent ----
+  // A chain = {srcHost, srcTask, prompt, dstHost, fired, note}. The panel
+  // watches the source task via the 5s fleet poll (task_list) and, once it
+  // finishes, dispatches `prompt` to `dstHost` with the result as context.
+  // Chains persist in localStorage per room, so a reload re-adopts them.
+  let chains = $state([]);
+
+  function chainStoreKey() {
+    return `fleet-chat:chains:${room}`;
+  }
+  function saveChains() {
+    try {
+      localStorage.setItem(chainStoreKey(), JSON.stringify(chains));
+    } catch {}
+  }
+  function loadChains() {
+    try {
+      chains = JSON.parse(localStorage.getItem(chainStoreKey()) || '[]');
+    } catch {
+      chains = [];
+    }
+  }
+
+  // The follow-up spec being composed ("Then…"): {prompt, dstHost}
+  let thenPrompt = $state('');
+  let thenHost = $state('');
+  let showThen = $state(false);
+
+  function openThen() {
+    if (!thenHost || !aiHosts.some((a) => a.id === thenHost)) {
+      thenHost = aiHosts[0]?.id || '';
+    }
+    showThen = true;
+  }
+
+  function submitThen(e) {
+    e.preventDefault();
+    if (!lastDispatch || !thenPrompt.trim() || !thenHost) return;
+    chains = [
+      ...chains,
+      {
+        srcHost: lastDispatch.host,
+        srcTask: lastDispatch.taskId,
+        prompt: thenPrompt.trim(),
+        dstHost: thenHost,
+        fired: false,
+      },
+    ];
+    saveChains();
+    thenPrompt = '';
+    showThen = false;
+    notify('⛓ Chain armed — follow-up will fire on completion', 'success');
+  }
+
+  // Evaluate pending chains against the fresh fleet task list. Called from
+  // pollFleet after each silent refresh.
+  async function runChains() {
+    for (const c of chains) {
+      if (c.fired) continue;
+      const src = fleetTasks.find((f) => f.host === c.srcHost);
+      const t = src?.tasks.find((x) => x.id === c.srcTask);
+      if (!t) continue; // task not visible (yet) — keep waiting
+      if (t.status !== 'done' && t.status !== 'failed') continue;
+      // Fire the follow-up on the destination host.
+      const dstName = agents.find((a) => a.id === c.dstHost)?.name || c.dstHost;
+      const ctx =
+        (t.result || t.error || '').slice(0, 2000) ||
+        (t.status === 'failed' ? '(failed without output)' : '(no output)');
+      const prompt =
+        `Chain follow-up (previous task on ${src.hostName} finished with status ${t.status}):\n` +
+        `--- previous result ---\n${ctx}\n--- end ---\n\n${c.prompt}`;
+      try {
+        const id = await relay.taskDispatch(c.dstHost, prompt);
+        c.fired = true;
+        c.firedTask = id || null;
+        notify(`⛓ Chain fired → ${dstName}`, 'success');
+      } catch (e) {
+        c.note = String(e?.message || e);
+        notify(`Chain dispatch to ${dstName} failed: ${c.note}`, 'error');
+      }
+      saveChains();
+      scheduleRefresh();
+    }
+    // Prune old fired chains (keep the 20 most recent).
+    const alive = chains.filter((c) => !c.fired);
+    const fired = chains.filter((c) => c.fired).slice(-20);
+    if (alive.length + fired.length !== chains.length) {
+      chains = [...alive, ...fired];
+      saveChains();
+    }
+  }
+
+  function cancelChain(i) {
+    chains = chains.filter((_, j) => j !== i);
+    saveChains();
   }
 
   // --- Inline images in chat -------------------------------------------------
@@ -830,6 +943,7 @@
     pendingChat = null;
     transcript = [];
     loadedKey = null;
+    chains = [];
     // Keep the encrypted cookie so the next visit only needs the PIN; just drop
     // the in-memory PIN. Use "Forget" in settings to remove the cookie.
     sessionPin = null;
@@ -859,7 +973,7 @@
             {#if activeDialog}
               {activeDialog.provider} · {activeDialog.hostName}
               {#if activeDialog.cwd} · {activeDialog.cwd}{/if}
-              {#if activeDialog.live} · <span class="live-tag">🟢 live on host</span>{/if}
+              {#if activeDialog.live} · <span class="live-tag">🟡 live · parallel-write</span>{/if}
               {#if !activeDialog.live && activeDialog.resumable === false} · <span class="live-tag">👁 view only</span>{/if}
             {:else if pendingChat}
               sent to {pendingChat.hostName} · waiting for a reply…
@@ -873,6 +987,7 @@
         {/if}
         <a class="ghost ic" href="#/" title="Home"><Icon name="home" /><span>Home</span></a>
         <button class="ghost ic" onclick={() => (showFiles = true)} title="Files"><Icon name="folder" /><span>Files</span></button>
+        <button class="ghost ic" onclick={() => (showGraph = true)} title="Agent graph"><Icon name="cloud" /><span>Graph</span></button>
         <button class="ghost ic" onclick={openTunnels} title="Tunnels"><Icon name="cloud" /><span>Tunnels</span></button>
         <button class="ghost ic icon-only" onclick={openSettings} title="Settings" aria-label="Settings"><Icon name="settings" /></button>
         <button class="ghost ic" onclick={logout} title="Log out"><Icon name="logout" /><span>Log out</span></button>
@@ -919,8 +1034,9 @@
           </div>
         {:else if activeDialog?.live}
           <div class="msg assistant"><div class="bubble dim">
-            🟢 This session is currently open manually on {activeDialog.hostName} —
-            it can't be continued from the web (conflict). You can only end it.
+            🟡 Parallel-debug mode: the session is also open on {activeDialog.hostName}.
+            Messages sent here run their own headless resume writing into the same
+            session store — turns may interleave with the interactive process.
           </div></div>
         {/if}
         {#if loadingTranscript}
@@ -1006,16 +1122,23 @@
           aria-label="Message to the fleet"
           rows="1"
           placeholder={composerLocked
-            ? activeDialog?.resumable === false && !activeDialog?.live
-              ? "This agent's history is view-only"
-              : 'Session is live on the host — can\'t continue here'
+            ? "This agent's history is view-only"
             : !canSend
               ? 'No AI host in the fleet'
               : activeDialog
-                ? `Continue on ${activeDialog.hostName}…`
+                ? activeDialog.live
+                  ? `Parallel-write into the live session on ${activeDialog.hostName}…`
+                  : `Continue on ${activeDialog.hostName}…`
                 : 'Message to the fleet…'}
           disabled={!canSend}
         ></textarea>
+        {#if lastDispatch}
+          <button
+            class="chain-btn"
+            onclick={openThen}
+            title="When the last task finishes, dispatch a follow-up agent"
+          >⛓</button>
+        {/if}
         <button class="send" onclick={send} disabled={sending || !input.trim() || !canSend} aria-label="Send"><Icon name="arrow-up" size={18} draw={false} /></button>
       </div>
     </section>
@@ -1073,6 +1196,27 @@
             <div class="item progress">
               <span class="item-title">{p.kind === 'cron' ? '⏰' : '⚙️'} {p.label}</span>
               <span class="item-meta">{p.hostName} · {p.detail}</span>
+            </div>
+          {/each}
+        </div>
+      {/if}
+
+      {#if chains.length > 0}
+        <div class="sec-title">⛓ Chains</div>
+        <div class="list">
+          {#each chains.slice(-8).reverse() as c, i}
+            <div class="item progress" title={c.prompt}>
+              <span class="item-title">
+                {c.fired ? '✅' : '⏳'}
+                {agents.find((a) => a.id === c.srcHost)?.name || c.srcHost}
+                → {agents.find((a) => a.id === c.dstHost)?.name || c.dstHost}
+              </span>
+              <span class="item-meta">
+                {c.fired ? 'fired' : 'waiting'} · {(c.prompt || '').slice(0, 40)}…
+                {#if !c.fired}
+                  <button class="chain-x" onclick={() => cancelChain(chains.indexOf(c))}>✕</button>
+                {/if}
+              </span>
             </div>
           {/each}
         </div>
@@ -1146,6 +1290,18 @@
           <button class="ghost" onclick={() => (showFiles = false)}>✕ Close</button>
         </header>
         <Files {relay} agents={executors} />
+      </div>
+    </div>
+  {/if}
+
+  {#if showGraph}
+    <div class="files-overlay" onclick={(e) => { if (e.target === e.currentTarget) showGraph = false; }}>
+      <div class="files-modal">
+        <header class="bar">
+          <strong>🕸 Agent graph</strong>
+          <button class="ghost" onclick={() => (showGraph = false)}>✕ Close</button>
+        </header>
+        <FleetGraph {agents} fleets={fleetTasks} />
       </div>
     </div>
   {/if}
@@ -1228,6 +1384,43 @@
           {/if}
         </div>
       </div>
+    </div>
+  {/if}
+
+  {#if showThen && lastDispatch}
+    <div class="files-overlay" onclick={(e) => { if (e.target === e.currentTarget) showThen = false; }}>
+      <form class="settings-modal" onsubmit={submitThen}>
+        <header class="bar">
+          <strong>⛓ Chain a follow-up agent</strong>
+          <button type="button" class="ghost" onclick={() => (showThen = false)}>✕ Close</button>
+        </header>
+        <div class="settings-body">
+          <p class="hint">
+            When the last dispatched task (on
+            {agents.find((a) => a.id === lastDispatch.host)?.name || lastDispatch.host}) finishes,
+            dispatch this prompt to the selected host with the previous result as context.
+          </p>
+          <label>Follow-up host</label>
+          <select bind:value={thenHost}>
+            {#each aiHosts as a}
+              <option value={a.id}>{a.name}{a.id === lastDispatch.host ? ' (same)' : ''}</option>
+            {/each}
+          </select>
+          <label>Follow-up prompt</label>
+          <textarea
+            class="then-text"
+            bind:value={thenPrompt}
+            placeholder="e.g. Analyze the build log above and fix the failing tests"
+            rows="4"
+          ></textarea>
+          <div class="settings-actions">
+            <button type="button" class="ghost" onclick={() => (showThen = false)}>Cancel</button>
+            <button type="submit" class="primary" disabled={!thenPrompt.trim() || !thenHost}>
+              Arm chain
+            </button>
+          </div>
+        </div>
+      </form>
     </div>
   {/if}
 
@@ -1886,6 +2079,53 @@
   .send:disabled {
     opacity: 0.4;
     cursor: not-allowed;
+  }
+
+  /* "Then…" chain button in the composer. */
+  .chain-btn {
+    background: var(--bg-3);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    width: 34px;
+    height: 34px;
+    color: var(--text-dim);
+    flex: none;
+    display: grid;
+    place-items: center;
+    cursor: pointer;
+    font-size: 15px;
+  }
+  .chain-btn:hover {
+    border-color: var(--accent);
+    color: var(--text);
+  }
+  /* Remove-a-chain ✕ in the sidebar list. */
+  .chain-x {
+    background: none;
+    border: none;
+    color: var(--text-faint);
+    cursor: pointer;
+    padding: 0 2px;
+    font-size: 11px;
+  }
+  .chain-x:hover {
+    color: #ff7a7a;
+  }
+  /* Follow-up prompt textarea in the chain modal. */
+  .then-text {
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 10px 12px;
+    color: var(--text);
+    font-size: 14px;
+    font-family: inherit;
+    outline: none;
+    resize: vertical;
+    min-height: 84px;
+  }
+  .then-text:focus {
+    border-color: var(--accent);
   }
 
   .new {
