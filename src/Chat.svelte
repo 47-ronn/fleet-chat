@@ -271,7 +271,6 @@
       await storeCreds(pin, creds);
     }
     loadPinned();
-    loadChains();
     authed = true;
     await refreshFleet();
     clearInterval(pollTimer);
@@ -484,6 +483,7 @@
   // sync without a manual refresh.
   let pollTimer = null;
   let refreshDebounce = null;
+  let pollCount = 0;
 
   function scheduleRefresh() {
     clearTimeout(refreshDebounce);
@@ -512,8 +512,8 @@
     } catch {
       return;
     }
-    // Fire any chains whose source task has finished.
-    if (chains.some((c) => !c.fired)) runChains();
+    // Refresh host-owned chains (display only; firing happens on the host).
+    if (pollCount++ % 6 === 0) refreshChains();
     // A live session is being driven on the host — pull any new turns so the
     // open chat updates as the user writes to it there.
     const d = activeDialog;
@@ -714,28 +714,12 @@
     return '⏱️ timed out waiting for a reply';
   }
 
-  // --- Task chains: "when this task finishes, dispatch a follow-up agent ----
-  // A chain = {srcHost, srcTask, prompt, dstHost, fired, note}. The panel
-  // watches the source task via the 5s fleet poll (task_list) and, once it
-  // finishes, dispatches `prompt` to `dstHost` with the result as context.
-  // Chains persist in localStorage per room, so a reload re-adopts them.
-  let chains = $state([]);
-
-  function chainStoreKey() {
-    return `fleet-chat:chains:${room}`;
-  }
-  function saveChains() {
-    try {
-      localStorage.setItem(chainStoreKey(), JSON.stringify(chains));
-    } catch {}
-  }
-  function loadChains() {
-    try {
-      chains = JSON.parse(localStorage.getItem(chainStoreKey()) || '[]');
-    } catch {
-      chains = [];
-    }
-  }
+  // --- Task chains: durable on the HOST (owner-side), shown here -----------
+  // Arming goes to the SOURCE host (it becomes the owner: persists the chain
+  // in its SQLite, replicates to peers per its own consensus logic, and its
+  // owner-tick fires the follow-up within ~10s). The panel only DISPLAYS
+  // chains polled from each host — closing this browser changes nothing.
+  let hostChains = $state([]); // [{host, hostName, chains: TaskChain[]}]
 
   // The follow-up spec being composed ("Then…"): {prompt, dstHost}
   let thenPrompt = $state('');
@@ -749,66 +733,52 @@
     showThen = true;
   }
 
-  function submitThen(e) {
+  async function submitThen(e) {
     e.preventDefault();
-    if (!lastDispatch || !thenPrompt.trim() || !thenHost) return;
-    chains = [
-      ...chains,
-      {
-        srcHost: lastDispatch.host,
-        srcTask: lastDispatch.taskId,
+    if (!thenPrompt.trim() || !thenHost || !lastDispatch) return;
+    // The owner is the host that runs the source task: its local owner-tick
+    // watches the task without relay round-trips and fires the follow-up.
+    const srcHost = lastDispatch.host;
+    try {
+      const chain = await relay.chainArm(srcHost, {
+        src_agent: srcHost,
+        src_task: lastDispatch.taskId,
+        dst_agent: thenHost,
         prompt: thenPrompt.trim(),
-        dstHost: thenHost,
-        fired: false,
-      },
-    ];
-    saveChains();
-    thenPrompt = '';
-    showThen = false;
-    notify('⛓ Chain armed — follow-up will fire on completion', 'success');
-  }
-
-  // Evaluate pending chains against the fresh fleet task list. Called from
-  // pollFleet after each silent refresh.
-  async function runChains() {
-    for (const c of chains) {
-      if (c.fired) continue;
-      const src = fleetTasks.find((f) => f.host === c.srcHost);
-      const t = src?.tasks.find((x) => x.id === c.srcTask);
-      if (!t) continue; // task not visible (yet) — keep waiting
-      if (t.status !== 'done' && t.status !== 'failed') continue;
-      // Fire the follow-up on the destination host.
-      const dstName = agents.find((a) => a.id === c.dstHost)?.name || c.dstHost;
-      const ctx =
-        (t.result || t.error || '').slice(0, 2000) ||
-        (t.status === 'failed' ? '(failed without output)' : '(no output)');
-      const prompt =
-        `Chain follow-up (previous task on ${src.hostName} finished with status ${t.status}):\n` +
-        `--- previous result ---\n${ctx}\n--- end ---\n\n${c.prompt}`;
-      try {
-        const id = await relay.taskDispatch(c.dstHost, prompt);
-        c.fired = true;
-        c.firedTask = id || null;
-        notify(`⛓ Chain fired → ${dstName}`, 'success');
-      } catch (e) {
-        c.note = String(e?.message || e);
-        notify(`Chain dispatch to ${dstName} failed: ${c.note}`, 'error');
+      });
+      if (!chain) {
+        notify('Host rejected the chain arm (consensus failed?)', 'error');
+        return;
       }
-      saveChains();
-      scheduleRefresh();
-    }
-    // Prune old fired chains (keep the 20 most recent).
-    const alive = chains.filter((c) => !c.fired);
-    const fired = chains.filter((c) => c.fired).slice(-20);
-    if (alive.length + fired.length !== chains.length) {
-      chains = [...alive, ...fired];
-      saveChains();
+      thenPrompt = '';
+      showThen = false;
+      notify(`⛓ Chain armed on ${srcHost} — host-owned, survives this tab`, 'success');
+      refreshChains();
+    } catch (err) {
+      notify('Failed to arm chain: ' + (err.message || err), 'error');
     }
   }
 
-  function cancelChain(i) {
-    chains = chains.filter((_, j) => j !== i);
-    saveChains();
+  // Pull every executor host's chain list (owner + replica copies).
+  async function refreshChains() {
+    if (!relay) return;
+    const out = [];
+    for (const a of executors) {
+      try {
+        const chains = await relay.chainList(a.id);
+        if (chains.length) out.push({ host: a.id, hostName: a.name, chains });
+      } catch {}
+    }
+    hostChains = out;
+  }
+
+  async function cancelChain(host, chainId) {
+    try {
+      await relay.chainCancel(host, chainId);
+      refreshChains();
+    } catch (err) {
+      notify('Failed to cancel: ' + (err.message || err), 'error');
+    }
   }
 
   // --- Inline images in chat -------------------------------------------------
@@ -943,7 +913,7 @@
     pendingChat = null;
     transcript = [];
     loadedKey = null;
-    chains = [];
+    hostChains = [];
     // Keep the encrypted cookie so the next visit only needs the PIN; just drop
     // the in-memory PIN. Use "Forget" in settings to remove the cookie.
     sessionPin = null;
@@ -1201,23 +1171,26 @@
         </div>
       {/if}
 
-      {#if chains.length > 0}
-        <div class="sec-title">⛓ Chains</div>
+      {#if hostChains.length > 0}
+        <div class="sec-title" title="Chains live on the hosts (owner + replicas); firing happens there, not in this tab">⛓ Chains (on hosts)</div>
         <div class="list">
-          {#each chains.slice(-8).reverse() as c, i}
-            <div class="item progress" title={c.prompt}>
-              <span class="item-title">
-                {c.fired ? '✅' : '⏳'}
-                {agents.find((a) => a.id === c.srcHost)?.name || c.srcHost}
-                → {agents.find((a) => a.id === c.dstHost)?.name || c.dstHost}
-              </span>
-              <span class="item-meta">
-                {c.fired ? 'fired' : 'waiting'} · {(c.prompt || '').slice(0, 40)}…
-                {#if !c.fired}
-                  <button class="chain-x" onclick={() => cancelChain(chains.indexOf(c))}>✕</button>
-                {/if}
-              </span>
-            </div>
+          {#each hostChains as hc (hc.host)}
+            {#each hc.chains.slice(0, 6) as c (c.chain_id)}
+              <div class="item progress" title={c.prompt}>
+                <span class="item-title">
+                  {c.state === 'fired' ? '✅' : c.state === 'cancelled' ? '🚫' : '⏳'}
+                  {agents.find((a) => a.id === c.src_agent)?.name || c.src_agent}
+                  → {agents.find((a) => a.id === c.dst_agent)?.name || c.dst_agent}
+                </span>
+                <span class="item-meta">
+                  {c.state} · {(c.prompt || '').slice(0, 32)}…
+                  {#if c.note}<span title={c.note}>· {c.note}</span>{/if}
+                  {#if c.state === 'armed'}
+                    <button class="chain-x" onclick={() => cancelChain(hc.host, c.chain_id)}>✕</button>
+                  {/if}
+                </span>
+              </div>
+            {/each}
           {/each}
         </div>
       {/if}

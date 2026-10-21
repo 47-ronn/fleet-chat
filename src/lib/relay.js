@@ -293,6 +293,39 @@ export class Relay {
     await this.sendCommand(agentId, { cmd: 'session_terminate', id });
   }
 
+  // --- Replicated task chains (durable on the host; see crates/.../chains.rs) ---
+
+  // Arm a chain ON `ownerId` (that host becomes the chain OWNER: persists it
+  // in its SQLite and its owner tick watches the source task and fires the
+  // follow-up — closing this panel changes nothing). Returns the stored chain.
+  async chainArm(ownerId, { src_agent, src_task, dst_agent, prompt }) {
+    const chain = {
+      chain_id: 'web-' + crypto.randomUUID(),
+      src_agent,
+      src_task,
+      dst_agent,
+      prompt,
+      owner: ownerId, // the host itself owns and fires it
+      state: 'armed',
+      created_at: Date.now(),
+    };
+    const res = await this.sendCommand(
+      ownerId,
+      { cmd: 'chain_arm', chain },
+      15000
+    );
+    return res.result_type === 'chain_ack' && res.ok ? chain : null;
+  }
+
+  async chainList(agentId) {
+    const res = await this.sendCommand(agentId, { cmd: 'chain_list' }, 8000);
+    return res.result_type === 'chain_list' ? res.chains || [] : [];
+  }
+
+  async chainCancel(agentId, chainId) {
+    await this.sendCommand(agentId, { cmd: 'chain_cancel', chain_id: chainId }, 8000);
+  }
+
   // --- File search, preview, and chunked download ---
 
   // Search files on a host. kind = 'name' | 'content' | 'image'. Empty roots →
