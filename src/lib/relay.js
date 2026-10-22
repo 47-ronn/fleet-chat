@@ -57,12 +57,19 @@ export class Relay {
   // Open the socket and complete the auth handshake; resolves with the session
   // id. Used for both the initial connect and each reconnect attempt.
   _open() {
-    const url = `${this.relayUrl}/ws/room/${encodeURIComponent(
-      this.room
-    )}?token=${encodeURIComponent(this.token)}`;
+    // The token travels in the Sec-WebSocket-Protocol header (the only header
+    // a browser WebSocket can set) instead of the URL — URLs leak into proxy
+    // and access logs. Both relays (Rust 0.1.44+, worker) resolve
+    // `bearer.<base64url(token)>` there; the auth frame repeats the same
+    // value for the out-of-band consistency check.
+    const b64 = btoa(this.token)
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/, '');
+    const url = `${this.relayUrl}/ws/room/${encodeURIComponent(this.room)}`;
 
     return new Promise((resolve, reject) => {
-      const ws = new WebSocket(url);
+      const ws = new WebSocket(url, [`bearer.${b64}`]);
       this.ws = ws;
       ws.binaryType = 'arraybuffer'; // protocol is binary protobuf
       const timer = setTimeout(() => {
