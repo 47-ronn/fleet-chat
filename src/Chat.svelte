@@ -43,6 +43,12 @@
   let copiedId = $state(false); // brief ✓ feedback after copying the session id
   // The most recent dispatched task (new-chat path), for "Then…" chaining.
   let lastDispatch = $state(null); // {host, taskId} | null
+  // "Needs you": live dialogs whose transcript tail shows a tool still
+  // PENDING a human answer (a question / permission) — key → tool name.
+  // Refreshed by a cheap tail poll (see pollWaiting); the open dialog's value
+  // is derived from its loaded transcript instead.
+  let waitingOn = $state(new Map());
+  let onlyWaiting = $state(false); // dialogs-list filter: only needs-you ones
 
   // Copy the selected session's id to the clipboard, with a short ✓ flip.
   async function copySessionId(id) {
@@ -56,31 +62,247 @@
     }
   }
 
+  // --- Chat export (Markdown) -------------------------------------------------
+  // Downloads the OPEN dialog's loaded transcript as a readable .md (the
+  // transcript is the host-capped tail — the truncation marker, if any, is a
+  // system message and travels with it).
+  function exportChat(d) {
+    if (!d || !transcript.length) {
+      notify('Сначала открой диалог с загруженной историей', 'error');
+      return;
+    }
+    const ts = (ms) => (ms ? new Date(ms).toLocaleString('ru-RU') : '');
+    const rows = [
+      `# ${d.title}`,
+      '',
+      `> ${d.provider} · ${d.hostName}${d.cwd ? ` · ${d.cwd}` : ''} · \`${d.id}\``,
+      `> экспорт из Fleet Chat: ${new Date().toLocaleString('ru-RU')}`,
+      '',
+    ];
+    for (const m of transcript) {
+      const who = m.role === 'user' ? '👤' : m.role === 'assistant' ? '🤖' : 'ℹ️';
+      rows.push(`**${who} ${m.role}**${m.ts ? ` · _${ts(m.ts)}_` : ''}`, '', m.text || '…', '');
+    }
+    const base = (d.title || d.id)
+      .replace(/[^\p{L}\p{N} _-]+/gu, '')
+      .trim()
+      .replace(/\s+/g, '_')
+      .slice(0, 60) || 'dialog';
+    const blob = new Blob([rows.join('\n')], { type: 'text/markdown;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${base}.md`;
+    document.body.appendChild(a); // Firefox requires the link in the DOM
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+  }
+
+  // --- Drag-and-drop file attachments ------------------------------------------
+  // Dragging files over the chat pane shows a drop hint; dropping uploads
+  // each file to the message's target host (WriteFile) and appends the
+  // on-host path to the composer, so the AI reads it with full context.
+  // Text files only — the wire carries UTF-8 strings (see relay.writeFile)
+  // — and ≲512 KiB each, to stay clear of the relay frame limit.
+  let dragOver = $state(false);
+  let dragTimer = null;
+
+  // The host files go to: the open dialog's host (continues its session) or,
+  // for a new chat, the host the composer would send to.
+  const dropTargetHost = $derived(activeDialog?.host || answeringHost());
+
+  function onDragOver(ev) {
+    if (!ev.dataTransfer?.types?.includes('Files')) return;
+    ev.preventDefault();
+    ev.dataTransfer.dropEffect = 'copy';
+    // dragover keeps firing while held over the pane; a short timeout after
+    // the last event clears the hint without child-element dragleave flicker.
+    dragOver = true;
+    clearTimeout(dragTimer);
+    dragTimer = setTimeout(() => (dragOver = false), 250);
+  }
+
+  async function onDrop(ev) {
+    if (!ev.dataTransfer?.types?.includes('Files')) return;
+    ev.preventDefault();
+    dragOver = false;
+    clearTimeout(dragTimer);
+    const files = [...(ev.dataTransfer?.files || [])];
+    if (files.length) await uploadFiles(files);
+  }
+
+  // Strict UTF-8 + a NUL-byte sniff: binary content must NOT ride the string
+  // wire (protobuf `string`), it would arrive corrupted.
+  function readFileText(f) {
+    return new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onerror = () => reject(new Error('файл не читается'));
+      r.onload = () => {
+        const buf = new Uint8Array(r.result);
+        if (buf.slice(0, 8192).includes(0)) {
+          return reject(new Error('бинарный файл — пока только текст (укажи путь к файлу на хосте)'));
+        }
+        try {
+          resolve(new TextDecoder('utf-8', { fatal: true }).decode(buf));
+        } catch {
+          reject(new Error('не UTF-8 — пока только текстовые файлы'));
+        }
+      };
+      r.readAsArrayBuffer(f);
+    });
+  }
+
+  async function uploadFiles(files) {
+    const host = dropTargetHost;
+    if (!relay || !host) {
+      notify('Не выбран хост-получатель для файлов', 'error');
+      return;
+    }
+    const hostName = agents.find((a) => a.id === host)?.name || host;
+    const uploaded = [];
+    for (const f of files) {
+      if (f.size > 512 * 1024) {
+        notify(`${f.name}: больше 512 КБ — не влезает в кадр релея`, 'error');
+        continue;
+      }
+      try {
+        const text = await readFileText(f);
+        // /tmp always exists (Linux hosts), the random prefix prevents
+        // clobbering, and the AI reads the absolute path from the message.
+        const safe = f.name.replace(/[\\/]+/g, '_');
+        const path = `/tmp/fleet-${Math.random().toString(36).slice(2, 8)}-${safe}`;
+        await relay.writeFile(host, path, text);
+        uploaded.push(path);
+        notify(`${f.name} → ${hostName}:${path}`, 'ok');
+      } catch (e) {
+        notify(`${f.name}: ${e?.message || e}`, 'error');
+      }
+    }
+    if (uploaded.length) {
+      const note = uploaded.map((p) => `Приложен файл: ${p}`).join('\n');
+      input = input ? input.replace(/\s+$/, '') + '\n' + note : note;
+      composerEl?.focus();
+    }
+  }
+
   // Dialogs filter: which providers (claude / opencode / cline / …) to show in
   // the chat list (empty = all). Set via the right-click context menu on the list.
   let providerFilter = $state(new Set());
   let hostMenu = $state(null); // {x, y} context-menu anchor, or null
 
-  // --- Fleet-wide full-text search over the chat history ---------------------
+  // --- Fleet-wide Algolia-style search modal over chat history & mentions ----
   // Fans `session_search` out to every executor host (each answers from its
-  // local BM25 index), merges hits by score, and jumps to the cited context
-  // (session_get window around the hit) on click.
+  // local BM25 index), merges hits by score, highlights matched terms, and
+  // jumps to the cited context (`session_get` window around the hit) on click
+  // or Enter.
+  let showSearch = $state(false);
+  let searchInputEl = $state(null);
   let searchQuery = $state('');
   let searching = $state(false);
   let searchHits = $state([]); // {…SessionSearchHit, host, hostName}
   let searchNote = $state(null);
+  let searchHostFilter = $state(''); // '' = all hosts, or agent id
+  let searchCursor = $state(0); // keyboard selection index in modal
+  let searchDebounce = null;
+  let searchSeq = 0;
+  let activeMention = $state(null); // {query, seq, snippet, markIdx} when viewing a window
+
+  function stepMentionMark(delta) {
+    if (!messagesEl || !activeMention) return;
+    const marks = [...messagesEl.querySelectorAll('mark.hl')];
+    if (!marks.length) return;
+    const next = ((activeMention.markIdx ?? 0) + delta + marks.length) % marks.length;
+    activeMention = { ...activeMention, markIdx: next, totalMarks: marks.length };
+    marks.forEach((m, i) => m.classList.toggle('current', i === next));
+    marks[next].scrollIntoView({ block: 'center', behavior: 'smooth' });
+  }
+
+  function openSearchModal(initial = '') {
+    showSearch = true;
+    if (initial && !searchQuery) searchQuery = initial;
+    requestAnimationFrame(() => searchInputEl?.focus());
+    if (searchQuery.trim() && !searchHits.length) runSearch();
+  }
+
+  function onSearchInput() {
+    searchCursor = 0;
+    clearTimeout(searchDebounce);
+    const q = searchQuery.trim();
+    if (!q) {
+      searchHits = [];
+      searchNote = null;
+      searching = false;
+      return;
+    }
+    searchDebounce = setTimeout(() => runSearch(), 240);
+  }
+
+  // Instant client-side title / cwd matches across loaded dialogs.
+  const titleMatches = $derived.by(() => {
+    const q = searchQuery.trim().toLowerCase();
+    if (!q) return [];
+    const terms = q.split(/\s+/).filter(Boolean);
+    return dedupedDialogs
+      .filter((d) => {
+        if (searchHostFilter && d.host !== searchHostFilter) return false;
+        const hay = `${d.title || ''} ${d.cwd || ''} ${d.provider || ''}`.toLowerCase();
+        return terms.every((t) => hay.includes(t));
+      })
+      .slice(0, 8);
+  });
+
+  // Deduplicate BM25 hits that point to the same (provider, session_id, seq)
+  // across mirrored hosts, keeping the preferred host.
+  const visibleSearchHits = $derived.by(() => {
+    const seen = new Set();
+    const out = [];
+    for (const h of searchHits) {
+      if (searchHostFilter && h.host !== searchHostFilter) continue;
+      const k = `${h.provider}:${h.session_id}:${h.seq ?? 0}`;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      out.push(h);
+    }
+    return out;
+  });
+
+  // Split text into [{text, mark}] segments for safe `<mark>` highlighting.
+  function highlightParts(text, query) {
+    const src = String(text || '').replace(/<\/?b>/gi, '');
+    const terms = String(query || '')
+      .trim()
+      .split(/\s+/)
+      .map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+      .filter((t) => t.length >= 2);
+    if (!terms.length || !src) return [{ text: src, mark: false }];
+    const re = new RegExp(`(${terms.join('|')})`, 'gi');
+    const parts = [];
+    let last = 0;
+    let m;
+    while ((m = re.exec(src)) !== null) {
+      if (m.index > last) parts.push({ text: src.slice(last, m.index), mark: false });
+      parts.push({ text: m[0], mark: true });
+      last = m.index + m[0].length;
+      if (m[0].length === 0) re.lastIndex++;
+    }
+    if (last < src.length) parts.push({ text: src.slice(last), mark: false });
+    return parts.length ? parts : [{ text: src, mark: false }];
+  }
 
   async function runSearch() {
     const q = searchQuery.trim();
-    if (!q || !relay || searching) return;
+    if (!q || !relay) return;
+    const mySeq = ++searchSeq;
     searching = true;
     searchNote = null;
     try {
       const providers = providerFilter.size ? [...providerFilter] : [];
       const hosts = executors;
       const results = await Promise.allSettled(
-        hosts.map((a) => relay.sessionSearch(a.id, q, providers, 20))
+        hosts.map((a) => relay.sessionSearch(a.id, q, providers, 25))
       );
+      if (mySeq !== searchSeq) return;
       const hits = [];
       let failed = 0;
       results.forEach((r, i) => {
@@ -94,15 +316,16 @@
       });
       hits.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
       searchHits = hits;
+      searchCursor = 0;
       searchNote = hits.length
         ? failed
           ? `${failed} host(s) failed to answer`
           : null
         : failed
-          ? `Nothing found (${failed} host(s) failed)`
-          : 'Nothing found — try other terms, or ask a host AI';
+          ? `Упоминаний в тексте не найдено (${failed} хост не ответил)`
+          : 'Точных упоминаний в сообщениях не найдено — попробуй другое слово';
     } finally {
-      searching = false;
+      if (mySeq === searchSeq) searching = false;
     }
   }
 
@@ -110,6 +333,7 @@
     searchQuery = '';
     searchHits = [];
     searchNote = null;
+    searchCursor = 0;
   }
 
   // Open a search hit: adopt (or synthesize) its dialog, then load the cited
@@ -135,7 +359,39 @@
     active = key;
     pendingChat = null;
     sidebarOpen = false;
+    showSearch = false;
+    activeMention = {
+      query: searchQuery.trim(),
+      seq: h.seq,
+      snippet: String(h.snippet || '').replace(/<\/?b>/gi, '').slice(0, 80),
+      matchCount: h.match_count || 1,
+    };
     loadTranscript(d, { force: true, aroundSeq: h.seq });
+  }
+
+  function onSearchModalKey(e) {
+    const total = visibleSearchHits.length + titleMatches.length;
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      if (total > 0) searchCursor = (searchCursor + 1) % total;
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (total > 0) searchCursor = (searchCursor - 1 + total) % total;
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      if (searchCursor < visibleSearchHits.length && visibleSearchHits[searchCursor]) {
+        openSearchHit(visibleSearchHits[searchCursor]);
+      } else {
+        const d = titleMatches[searchCursor - visibleSearchHits.length];
+        if (d) {
+          showSearch = false;
+          activeMention = null;
+          openDialog(d);
+        } else {
+          runSearch();
+        }
+      }
+    }
   }
 
   function openHostMenu(e) {
@@ -178,9 +434,38 @@
     } catch {}
   }
 
+  // Deduplicate sessions replicated across multiple hosts (same `provider:id`
+  // after a database migration): keep one representative card, preferring a
+  // live host, then a non-legacy host (anything other than `79f33ac4`), then the
+  // freshest timestamp; surface the extra host names as `alsoOn` so the user
+  // still sees where copies live.
+  const dedupedDialogs = $derived.by(() => {
+    const bySid = new Map();
+    const score = (d) =>
+      (d.live ? 4 : 0) + (pinned.has(d.key) ? 2 : 0) + (d.hostName !== '79f33ac4' ? 1 : 0);
+    for (const d of dialogs) {
+      const sid = `${d.provider}:${d.id}`;
+      const cur = bySid.get(sid);
+      if (!cur) {
+        bySid.set(sid, { ...d, alsoOn: [] });
+        continue;
+      }
+      const pickNew =
+        score(d) > score(cur) ||
+        (score(d) === score(cur) && (d.updated || 0) > (cur.updated || 0));
+      if (pickNew) {
+        const also = cur.alsoOn.includes(cur.hostName) ? cur.alsoOn : [...cur.alsoOn, cur.hostName];
+        bySid.set(sid, { ...d, alsoOn: also.filter((h) => h !== d.hostName) });
+      } else if (d.hostName !== cur.hostName && !cur.alsoOn.includes(d.hostName)) {
+        cur.alsoOn.push(d.hostName);
+      }
+    }
+    return [...bySid.values()];
+  });
+
   // Pinned first, then by recency (the order refreshFleet already applies).
   const sortedDialogs = $derived(
-    [...dialogs].sort(
+    [...dedupedDialogs].sort(
       (a, b) => (pinned.has(b.key) ? 1 : 0) - (pinned.has(a.key) ? 1 : 0)
     )
   );
@@ -192,10 +477,25 @@
       .map(([provider, count]) => ({ provider, count }))
       .sort((a, b) => a.provider.localeCompare(b.provider))
   );
-  // Apply the provider filter (empty filter = show everything).
-  const visibleDialogs = $derived(
-    providerFilter.size ? sortedDialogs.filter((d) => providerFilter.has(d.provider)) : sortedDialogs
-  );
+  // key → waiting tool name across all dialogs: the tail poll's map, with the
+  // OPEN dialog's entry derived from its loaded transcript (fresher).
+  const waitingDialogs = $derived.by(() => {
+    const m = new Map(waitingOn);
+    if (activeDialog && transcript.length) {
+      const tail = [...transcript].reverse().find((x) => x.role !== 'system');
+      if (tail?.waiting) m.set(activeDialog.key, tail.waiting);
+      else m.delete(activeDialog.key);
+    }
+    return m;
+  });
+
+  // Apply the provider filter (empty filter = show everything) and the
+  // needs-you filter.
+  const visibleDialogs = $derived.by(() => {
+    let ds = providerFilter.size ? sortedDialogs.filter((d) => providerFilter.has(d.provider)) : sortedDialogs;
+    if (onlyWaiting) ds = ds.filter((d) => waitingDialogs.has(d.key));
+    return ds;
+  });
 
   // Grow the composer to fit its content (capped by CSS max-height). Re-runs
   // whenever `input` changes — including the programmatic clear after send.
@@ -410,16 +710,6 @@
       const ip = [];
       const he = [];
       const ft = [];
-      // Warn about machines with several live connections under one agent-id:
-      // a wrong-keyed/stale socket among them can hijack routing (key mismatch).
-      for (const a of agents) {
-        if ((a.connections ?? 1) > 1) {
-          he.push({
-            hostName: a.name,
-            error: `${a.connections} connections under one agent-id — close the extra sessions (possible key/version conflict)`,
-          });
-        }
-      }
       // Only executor peers have local history / a task DB.
       for (const a of agents.filter((x) => x.accepts_commands !== false)) {
         try {
@@ -452,14 +742,32 @@
           const ts = await relay.taskList(a.id);
           ft.push({ host: a.id, hostName: a.name, tasks: ts });
           for (const t of ts) {
-            if (t.status === 'running') {
-              ip.push({ host: a.id, hostName: a.name, kind: 'task', label: (t.prompt || t.id).slice(0, 60), detail: 'running' });
+            if (t.status === 'running' || t.status === 'queued') {
+              ip.push({
+                host: a.id,
+                hostName: a.name,
+                kind: 'task',
+                taskId: t.id,
+                prompt: t.prompt || t.id,
+                createdAt: t.created_at || 0,
+                label: (t.prompt || t.id).slice(0, 60),
+                detail: t.status,
+              });
             }
           }
         } catch {}
         try {
           for (const c of await relay.scheduleList(a.id)) {
-            ip.push({ host: a.id, hostName: a.name, kind: 'cron', label: c.name, detail: c.cron });
+            ip.push({
+              host: a.id,
+              hostName: a.name,
+              kind: 'cron',
+              command: c.command || '',
+              lastRun: c.last_run || null,
+              runCount: c.run_count || 0,
+              label: c.name,
+              detail: c.cron,
+            });
           }
         } catch {}
       }
@@ -503,6 +811,26 @@
     scheduleRefresh();
   }
 
+  // Needs-you poll: live sessions get a cheap TAIL fetch (a tiny window at
+  // the very end of the transcript) to see whether the agent stopped on a
+  // tool still PENDING a human answer (question / permission). Only live
+  // dialogs — a dead session can't be waiting. Runs every ~10s.
+  async function pollWaiting() {
+    if (!relay || !authed) return;
+    const live = dialogs.filter((d) => d.live);
+    const next = new Map();
+    await Promise.allSettled(
+      live.map(async (d) => {
+        try {
+          const msgs = await relay.sessionGet(d.host, d.provider, d.id, 1_000_000, 2);
+          const tail = [...(msgs || [])].reverse().find((m) => m.role !== 'system');
+          if (tail?.waiting) next.set(d.key, tail.waiting);
+        } catch {}
+      })
+    );
+    waitingOn = next;
+  }
+
   async function pollFleet() {
     if (!relay || !authed) return;
     // A poll landing mid-reconnect rejects with 'disconnected'; ignore it and
@@ -514,6 +842,8 @@
     }
     // Refresh host-owned chains (display only; firing happens on the host).
     if (pollCount++ % 6 === 0) refreshChains();
+    // Needs-you tails (every other 5s tick ≈ 10s).
+    if (pollCount % 2 === 0) pollWaiting();
     // A live session is being driven on the host — pull any new turns so the
     // open chat updates as the user writes to it there.
     const d = activeDialog;
@@ -551,12 +881,17 @@
         transcript = msgs;
         transcriptError = null;
         if (aroundSeq !== null) {
-          // The window is centered on the cited message — bring the middle of
-          // the transcript into view once it renders.
+          // Scroll directly to the first highlighted `<mark class="hl">` inside
+          // the loaded window (or fall back to the middle of the window).
           requestAnimationFrame(() => {
             if (!messagesEl) return;
-            messagesEl.scrollTop =
-              messagesEl.scrollHeight / 2 - messagesEl.clientHeight / 2;
+            const mark = messagesEl.querySelector('mark.hl') || messagesEl.querySelector('.bubble.mention-hit');
+            if (mark) {
+              mark.scrollIntoView({ block: 'center', behavior: 'smooth' });
+            } else {
+              messagesEl.scrollTop =
+                messagesEl.scrollHeight / 2 - messagesEl.clientHeight / 2;
+            }
           });
         }
       }
@@ -592,7 +927,98 @@
   function openDialog(d) {
     active = d.key;
     pendingChat = null;
+    activeMention = null;
     sidebarOpen = false;
+  }
+
+  // Click an "In progress" item: if it's a running/queued task, jump to the
+  // matching live dialog on that host if one exists, otherwise open the task
+  // itself in the chat pane and poll `taskGet` until its result lands. For a
+  // cron job, show its schedule + command in the chat pane.
+  async function openProgressItem(p) {
+    sidebarOpen = false;
+    if (p.kind === 'task') {
+      const needle = (p.prompt || '').trim().slice(0, 32).toLowerCase();
+      const match =
+        dialogs.find((d) => d.host === p.host && d.live) ||
+        (needle &&
+          dialogs.find(
+            (d) => d.host === p.host && (d.title || '').toLowerCase().includes(needle)
+          ));
+      if (match) {
+        openDialog(match);
+        return;
+      }
+      active = null;
+      loadedKey = null;
+      transcriptError = null;
+      loadingTranscript = false;
+      pendingChat = { host: p.host, hostName: p.hostName, taskId: p.taskId, title: p.label, live: true };
+      transcript = [
+        { role: 'user', text: p.prompt || p.label, ts: p.createdAt || undefined },
+        {
+          role: 'assistant',
+          text: `⏳ Задача ${p.taskId} выполняется на ${p.hostName} (${p.detail})…`,
+          host: p.host,
+        },
+      ];
+      lastDispatch = p.taskId ? { host: p.host, taskId: p.taskId } : null;
+      if (p.taskId && relay) {
+        try {
+          const t = await relay.taskGet(p.host, p.taskId);
+          if (t && pendingChat?.taskId === p.taskId) {
+            if (t.status === 'done') {
+              pendingChat = { ...pendingChat, live: false };
+              transcript = [
+                { role: 'user', text: t.prompt || p.prompt, ts: t.created_at || undefined },
+                { role: 'assistant', text: t.result || '(пустой ответ)', host: p.host },
+              ];
+            } else if (t.status === 'failed') {
+              pendingChat = { ...pendingChat, live: false };
+              transcript = [
+                { role: 'user', text: t.prompt || p.prompt, ts: t.created_at || undefined },
+                { role: 'assistant', text: (t.result ? t.result + '\n\n' : '') + '⚠️ ' + (t.error || 'failed'), host: p.host },
+              ];
+            } else {
+              if (t.result) {
+                transcript = [
+                  { role: 'user', text: t.prompt || p.prompt, ts: t.created_at || undefined },
+                  { role: 'assistant', text: t.result + '\n\n⏳ (выполняется…)', host: p.host },
+                ];
+              }
+              const reply = await pollTask(p.host, p.taskId, (liveTask) => {
+                if (pendingChat?.taskId === p.taskId && liveTask.result) {
+                  transcript = [
+                    { role: 'user', text: liveTask.prompt || p.prompt, ts: liveTask.created_at || undefined },
+                    { role: 'assistant', text: liveTask.result + '\n\n⏳ (выполняется…)', host: p.host },
+                  ];
+                }
+              });
+              if (reply != null && pendingChat?.taskId === p.taskId) {
+                pendingChat = { ...pendingChat, live: false };
+                transcript = [
+                  { role: 'user', text: t.prompt || p.prompt, ts: t.created_at || undefined },
+                  { role: 'assistant', text: reply, host: p.host },
+                ];
+              }
+            }
+          }
+        } catch {}
+      }
+      return;
+    }
+    active = null;
+    loadedKey = null;
+    transcriptError = null;
+    loadingTranscript = false;
+    pendingChat = { host: p.host, hostName: p.hostName, title: `⏰ ${p.label}` };
+    const lastStr = p.lastRun ? new Date(p.lastRun).toLocaleString('ru-RU') : 'ещё не запускалась';
+    transcript = [
+      {
+        role: 'system',
+        text: `⏰ Плановая задача «${p.label}» на ${p.hostName}\nРасписание: ${p.detail} · запусков: ${p.runCount} · последний: ${lastStr}${p.command ? `\nКоманда: ${p.command}` : ''}`,
+      },
+    ];
   }
 
   // Toggle a host in the composer; selecting inserts an @tag into the text so
@@ -635,23 +1061,87 @@
   const composerLocked = $derived(!!activeDialog && activeDialog.resumable === false);
   const canSend = $derived(activeDialog ? !composerLocked : aiHosts.length > 0);
 
+  // Stop a running/queued autonomous task (from the header or an In-progress card).
+  async function cancelTaskItem(host, taskId, ev) {
+    if (ev) ev.stopPropagation();
+    if (!relay || !host || !taskId) return;
+    try {
+      const t = await relay.taskCancel(host, taskId);
+      inProgress = inProgress.filter((x) => x.taskId !== taskId);
+      notify(`Задача ${taskId.slice(0, 8)}… остановлена`, 'ok');
+      if (pendingChat?.taskId === taskId) {
+        pendingChat = { ...pendingChat, live: false };
+        const prev = t?.result ? t.result + '\n\n' : '';
+        transcript = [
+          transcript[0] || { role: 'user', text: pendingChat.title || taskId },
+          { role: 'assistant', text: `${prev}⏹ Остановлено пользователем`, host },
+        ];
+      }
+      await refreshFleet({ silent: true });
+    } catch (e) {
+      notify('Не удалось остановить: ' + (e?.message || e), 'error');
+    }
+  }
+
+  // Arm a follow-up subtask on another agent from an In-progress task card.
+  function openSubtask(p, ev) {
+    if (ev) ev.stopPropagation();
+    if (!p?.taskId) return;
+    lastDispatch = { host: p.host, taskId: p.taskId };
+    openThen();
+  }
+
   async function send() {
     const text = input.trim();
     if (!text || sending || composerLocked) return;
     sending = true;
     try {
+      if (pendingChat?.taskId && pendingChat?.live) {
+        // Live running task open in the chat pane: try writing directly to its
+        // stdin (`task_input`); if the runner closed stdin (one-shot CLI), fall
+        // back to queuing a follow-up task on the same host.
+        const { host, taskId } = pendingChat;
+        input = '';
+        transcript = [...transcript, { role: 'user', text }];
+        try {
+          await relay.taskInput(host, taskId, text);
+          notify('Отправлено в stdin выполняющейся задачи', 'ok');
+          return;
+        } catch {
+          const nextId = await relay.taskDispatch(host, text);
+          if (nextId) {
+            pendingChat = { ...pendingChat, taskId: nextId, live: true };
+            lastDispatch = { host, taskId: nextId };
+            const reply = await pollTask(host, nextId);
+            if (reply != null) transcript = [...transcript, { role: 'assistant', text: reply, host }];
+          }
+          return;
+        }
+      }
       if (activeDialog) {
         // Continue an existing provider session on the host that owns it.
         const d = activeDialog;
         transcript = [...transcript, { role: 'user', text }];
         input = '';
+        const baseLen = transcript.length;
         const taskId = await relay.sessionResume(d.host, d.provider, d.id, text);
-        const reply = await pollTask(d.host, taskId);
-        if (reply != null) transcript = [...transcript, { role: 'assistant', text: reply, host: d.host }];
+        const reply = await pollTask(d.host, taskId, (liveTask) => {
+          if (active === d.key && liveTask.result) {
+            transcript = [
+              ...transcript.slice(0, baseLen),
+              { role: 'assistant', text: liveTask.result + '\n\n⏳ (выполняется…)', host: d.host },
+            ];
+          }
+        });
+        if (reply != null) {
+          transcript = [
+            ...transcript.slice(0, baseLen),
+            { role: 'assistant', text: reply, host: d.host },
+          ];
+        }
       } else {
-        // New chat → dispatch to an AI host. Show the message + a typing
-        // indicator locally while the host runs the task, then adopt the
-        // provider session it creates.
+        // New chat → dispatch to an AI host. Show the message + live streaming
+        // output while the host runs the task, then adopt the provider session.
         const host = answeringHost();
         if (!host) {
           notify('No AI-provider host in the fleet ✨. Start a node where claude/opencode is available.', 'error');
@@ -662,20 +1152,23 @@
         selected = new Set();
         const hostName = aiHosts.find((a) => a.id === host)?.name || host;
         const before = new Set(dialogs.map((d) => d.key));
-        pendingChat = { host, hostName };
+        pendingChat = { host, hostName, title: msg.slice(0, 60), live: true };
         transcript = [{ role: 'user', text: msg }];
         const taskId = await relay.taskDispatch(host, msg);
+        pendingChat = { host, hostName, taskId, title: msg.slice(0, 60), live: true };
         lastDispatch = taskId ? { host, taskId } : null;
-        const reply = await pollTask(host, taskId);
-        if (reply != null) transcript = [...transcript, { role: 'assistant', text: reply, host }];
-        // The reply is in — stop the "typing…" indicator now. The session
-        // adoption below is background housekeeping (it can take seconds to many
-        // refreshes if the host is slow to surface the new session) and must NOT
-        // keep the indicator/composer locked.
+        const reply = await pollTask(host, taskId, (liveTask) => {
+          if (pendingChat?.taskId === taskId && liveTask.result) {
+            transcript = [
+              { role: 'user', text: msg },
+              { role: 'assistant', text: liveTask.result + '\n\n⏳ (выполняется…)', host },
+            ];
+          }
+        });
+        pendingChat = pendingChat ? { ...pendingChat, live: false } : null;
+        if (reply != null) transcript = [{ role: 'user', text: msg }, { role: 'assistant', text: reply, host }];
+        // The reply is in — stop the "typing…" indicator now.
         sending = false;
-        // Adopt the newly-created provider session so the NEXT message resumes
-        // it (conversation context). The host drops its session-list cache on
-        // task finish, so it appears quickly; retry a few times for scan lag.
         let fresh = null;
         for (let i = 0; i < 4 && !fresh; i++) {
           await refreshFleet();
@@ -683,11 +1176,9 @@
           if (!fresh) await new Promise((r) => setTimeout(r, 1200));
         }
         if (fresh) {
-          active = fresh.key; // subsequent send() goes through sessionResume
+          active = fresh.key;
           pendingChat = null;
         }
-        // else: session not surfaced yet — keep the local transcript; the next
-        // refresh will adopt it under "Dialogs".
       }
     } catch (err) {
       notify('Failed to send: ' + (err.message || err), 'error');
@@ -696,11 +1187,13 @@
     }
   }
 
-  // Poll a host for an autonomous task result; returns the reply text.
-  async function pollTask(host, id) {
+  // Poll a host for an autonomous task result; calls `onProgress(task)` with
+  // partial streaming stdout while `status === 'running'`, and returns the
+  // final reply text.
+  async function pollTask(host, id, onProgress = null) {
     if (!id) return null;
-    for (let i = 0; i < 90; i++) {
-      await new Promise((r) => setTimeout(r, 2000));
+    for (let i = 0; i < 120; i++) {
+      await new Promise((r) => setTimeout(r, 1500));
       let task;
       try {
         task = await relay.taskGet(host, id);
@@ -708,8 +1201,14 @@
         continue;
       }
       if (!task) continue;
+      if (task.status === 'running' && onProgress && task.result) {
+        try { onProgress(task); } catch {}
+      }
       if (task.status === 'done') return task.result || '';
-      if (task.status === 'failed') return '⚠️ ' + (task.error || 'error');
+      if (task.status === 'failed') {
+        const prefix = task.result ? task.result + '\n\n' : '';
+        return prefix + '⚠️ ' + (task.error || 'error');
+      }
     }
     return '⏱️ timed out waiting for a reply';
   }
@@ -918,19 +1417,53 @@
     // the in-memory PIN. Use "Forget" in settings to remove the cookie.
     sessionPin = null;
   }
+  function onGlobalKey(e) {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+      e.preventDefault();
+      if (authed) openSearchModal();
+      return;
+    }
+    if (e.key !== 'Escape') return;
+    if (hostMenu) hostMenu = null;
+    else if (showSearch) showSearch = false;
+    else if (showThen) showThen = false;
+    else if (showTunnels) showTunnels = false;
+    else if (showSettings) showSettings = false;
+    else if (showGraph) showGraph = false;
+    else if (showFiles) showFiles = false;
+    else if (sidebarOpen) sidebarOpen = false;
+  }
 </script>
+
+<svelte:window onkeydown={onGlobalKey} />
 
 {#if !authed}
   <Auth onConnect={onConnect} />
 {:else}
   <div class="main">
     <!-- Chat pane (left) -->
-    <section class="chat">
+    <section class="chat" ondragover={onDragOver} ondrop={onDrop}>
+      {#if dragOver}
+        <div class="dropzone" aria-hidden="true">
+          <div class="dropzone-card">
+            📥 Отпусти файлы — уйдут на
+            <b>{agents.find((a) => a.id === dropTargetHost)?.name || dropTargetHost || '…'}</b>
+            и приложатся к сообщению
+            <div class="dropzone-note">текстовые файлы до 512 КБ · попадут в /tmp/fleet-… на хосте</div>
+          </div>
+        </div>
+      {/if}
       <header class="bar">
         <div class="bar-left">
           <span class="title-row">
-            <strong>{activeDialog ? activeDialog.title : 'New chat'}</strong>
+            <strong>{activeDialog ? activeDialog.title : pendingChat?.title || 'New chat'}</strong>
             {#if activeDialog}
+              <button
+                class="copy-id"
+                title="Экспорт диалога в Markdown"
+                aria-label="Export dialog"
+                onclick={() => exportChat(activeDialog)}
+              >📥</button>
               <button
                 class="copy-id"
                 title={copiedId ? 'Copied!' : `Copy session id (${activeDialog.id})`}
@@ -943,6 +1476,7 @@
             {#if activeDialog}
               {activeDialog.provider} · {activeDialog.hostName}
               {#if activeDialog.cwd} · {activeDialog.cwd}{/if}
+              {#if waitingDialogs.has(activeDialog.key)} · <span class="live-tag wait-tag">⏳ ждёт ответа</span>{/if}
               {#if activeDialog.live} · <span class="live-tag">🟡 live · parallel-write</span>{/if}
               {#if !activeDialog.live && activeDialog.resumable === false} · <span class="live-tag">👁 view only</span>{/if}
             {:else if pendingChat}
@@ -954,6 +1488,9 @@
         </div>
         {#if activeDialog && activeDialog.live}
           <button class="ghost danger" onclick={() => terminateSession(activeDialog)}>End session</button>
+        {:else if pendingChat?.taskId && pendingChat?.live}
+          <button class="ghost" onclick={openThen} title="Делегировать подзадачу другому агенту по завершении">⛓ Подзадача</button>
+          <button class="ghost danger" onclick={(e) => cancelTaskItem(pendingChat.host, pendingChat.taskId, e)}>⏹ Stop task</button>
         {/if}
         <a class="ghost ic" href="#/" title="Home"><Icon name="home" /><span>Home</span></a>
         <button class="ghost ic" onclick={() => (showFiles = true)} title="Files"><Icon name="folder" /><span>Files</span></button>
@@ -1002,6 +1539,11 @@
                 <code>opencode</code> on its PATH — it will show up with a ✨ badge.</p>
             {/if}
           </div>
+        {:else if activeDialog && waitingDialogs.has(activeDialog.key)}
+          <div class="msg assistant"><div class="bubble waiting wait-banner">
+            ⏳ Агент остановился и ждёт ответа ({waitingDialogs.get(activeDialog.key)}).
+            Ответь прямо здесь — сообщение продолжит ту же сессию, — либо ответь на хосте.
+          </div></div>
         {:else if activeDialog?.live}
           <div class="msg assistant"><div class="bubble dim">
             🟡 Parallel-debug mode: the session is also open on {activeDialog.hostName}.
@@ -1016,10 +1558,29 @@
             Failed to load dialog: {transcriptError}
           </div></div>
         {/if}
+        {#if activeMention && activeDialog}
+          <div class="mention-bar">
+            <span>🔍 Упоминание «<b>{activeMention.query}</b>» · сообщ. #{activeMention.seq} ({activeMention.matchCount} в этом чате)</span>
+            <div class="mention-acts">
+              <button type="button" class="ghost" title="Предыдущее совпадение в окне" onclick={() => stepMentionMark(-1)}>↑ Пред.</button>
+              <button type="button" class="ghost" title="Следующее совпадение в окне" onclick={() => stepMentionMark(1)}>↓ След.</button>
+              <button type="button" class="ghost" onclick={() => { activeMention = null; loadTranscript(activeDialog, { force: true }); }}>Показать весь чат</button>
+              <button type="button" class="ghost" onclick={() => openSearchModal()}>К результатам (Ctrl+K)</button>
+            </div>
+          </div>
+        {/if}
         {#each transcript as m, i}
+          {@const isMentionHit = activeMention?.query && m.role !== 'system' && highlightParts(m.text, activeMention.query).some((p) => p.mark)}
           <div class="msg {m.role}">
-            <div class="bubble">
-              {m.text || '…'}
+            <div class="bubble" class:waiting={m.waiting} class:mention-hit={isMentionHit}>
+              {#if m.waiting}
+                <div class="wait-line">⏳ ждёт вашего ответа · {m.waiting}</div>
+              {/if}
+              {#if isMentionHit}
+                {#each highlightParts(m.text || '…', activeMention.query) as seg}{#if seg.mark}<mark class="hl">{seg.text}</mark>{:else}{seg.text}{/if}{/each}
+              {:else}
+                {m.text || '…'}
+              {/if}
               {#if m.text}
                 <button
                   class="copy-btn"
@@ -1086,6 +1647,8 @@
 
       <div class="composer">
         <textarea
+          id="composer-input"
+          name="message"
           bind:this={composerEl}
           bind:value={input}
           onkeydown={onComposerKey}
@@ -1095,11 +1658,13 @@
             ? "This agent's history is view-only"
             : !canSend
               ? 'No AI host in the fleet'
-              : activeDialog
-                ? activeDialog.live
-                  ? `Parallel-write into the live session on ${activeDialog.hostName}…`
-                  : `Continue on ${activeDialog.hostName}…`
-                : 'Message to the fleet…'}
+              : pendingChat?.taskId && pendingChat?.live
+                ? `Напиши ввод для задачи на ${pendingChat.hostName} (или следующую инструкцию)…`
+                : activeDialog
+                  ? activeDialog.live
+                    ? `Parallel-write into the live session on ${activeDialog.hostName}…`
+                    : `Continue on ${activeDialog.hostName}…`
+                  : 'Message to the fleet…'}
           disabled={!canSend}
         ></textarea>
         {#if lastDispatch}
@@ -1122,50 +1687,51 @@
     <aside class="sidebar" class:open={sidebarOpen}>
       <button class="new" onclick={newChat}><Icon name="plus" size={16} /><span>New chat</span></button>
 
-      <div class="search-box">
-        <input
-          bind:value={searchQuery}
-          placeholder="Search all dialogs…"
-          title="Full-text search over every host's AI-chat history"
-          onkeydown={(e) => e.key === 'Enter' && runSearch()}
-        />
-        {#if searchQuery || searchHits.length || searchNote}
-          <button class="search-clear" aria-label="Clear search" onclick={clearSearch}>✕</button>
-        {:else}
-          <button class="search-go" aria-label="Search" onclick={runSearch} disabled={searching || !searchQuery.trim()}>🔍</button>
-        {/if}
-      </div>
-      {#if searching}
-        <div class="muted">Searching the fleet… (first search may build the index)</div>
-      {:else if searchHits.length}
-        <div class="sec-title search-head">
-          Found: {searchHits.length}
-          {#if providerFilter.size}<span class="muted">· {[...providerFilter].join(', ')}</span>{/if}
-        </div>
-        <div class="list">
-          {#each searchHits as h (h.host + ':' + h.provider + ':' + h.session_id)}
-            <button class="item hit" onclick={() => openSearchHit(h)}>
-              <span class="item-title">{h.title}</span>
-              <span class="item-meta">
-                <span class="prov {h.provider}">{h.provider}</span> · {h.hostName}
-                · {h.match_count} match{h.match_count === 1 ? '' : 'es'}
-                · {(h.score ?? 0).toFixed(2)}
-              </span>
-              <span class="hit-snippet">{h.snippet}</span>
-            </button>
-          {/each}
-        </div>
-      {:else if searchNote}
-        <div class="muted">{searchNote}</div>
-      {/if}
+      <button type="button" class="algolia-trigger" onclick={() => openSearchModal()} title="Поиск по чатам и упоминаниям (Ctrl+K)">
+        <span class="alg-left">🔍 <span>{searchQuery || 'Поиск по чатам и упоминаниям…'}</span></span>
+        <kbd class="alg-kbd">Ctrl K</kbd>
+      </button>
 
       {#if inProgress.length > 0}
-        <div class="sec-title">In progress</div>
-        <div class="list">
+        <div class="sec-title">In progress · {inProgress.length}</div>
+        <div class="list compact-list">
           {#each inProgress as p}
-            <div class="item progress">
-              <span class="item-title">{p.kind === 'cron' ? '⏰' : '⚙️'} {p.label}</span>
-              <span class="item-meta">{p.hostName} · {p.detail}</span>
+            <div
+              class="item progress"
+              class:cron={p.kind === 'cron'}
+              class:on={pendingChat && ((p.taskId && pendingChat.taskId === p.taskId) || pendingChat.title === `⏰ ${p.label}`)}
+            >
+              <button
+                type="button"
+                class="progress-open"
+                title={p.kind === 'cron' ? `${p.label} (${p.detail}) — нажми для деталей` : `${p.prompt || p.label} — нажми, чтобы открыть`}
+                onclick={() => openProgressItem(p)}
+              >
+                <span class="item-title">{p.kind === 'cron' ? '⏰' : '⚙️'} {p.label}</span>
+                <span class="item-meta">
+                  <span class="meta-host">{p.hostName}</span>
+                  <span class="meta-dot">·</span>
+                  <span class="meta-state" class:run={p.detail === 'running'}>{p.detail}</span>
+                </span>
+              </button>
+              {#if p.kind === 'task' && p.taskId}
+                <div class="progress-acts">
+                  <button
+                    type="button"
+                    class="prog-act"
+                    title="Дать подзадачу другому агенту"
+                    aria-label="Chain subtask"
+                    onclick={(e) => openSubtask(p, e)}
+                  >⛓</button>
+                  <button
+                    type="button"
+                    class="prog-act stop"
+                    title="Остановить задачу"
+                    aria-label="Stop task"
+                    onclick={(e) => cancelTaskItem(p.host, p.taskId, e)}
+                  >⏹</button>
+                </div>
+              {/if}
             </div>
           {/each}
         </div>
@@ -1173,24 +1739,33 @@
 
       {#if hostChains.length > 0}
         <div class="sec-title" title="Chains live on the hosts (owner + replicas); firing happens there, not in this tab">⛓ Chains (on hosts)</div>
-        <div class="list">
+        <div class="list compact-list">
           {#each hostChains as hc (hc.host)}
-            {#each hc.chains.slice(0, 6) as c (c.chain_id)}
-              <div class="item progress" title={c.prompt}>
+            {@const armed = hc.chains.filter((c) => c.state === 'armed')}
+            {@const doneCount = hc.chains.filter((c) => c.state !== 'armed').length}
+            {#each armed as c (c.chain_id)}
+              <div class="item progress chain" title={c.prompt}>
                 <span class="item-title">
-                  {c.state === 'fired' ? '✅' : c.state === 'cancelled' ? '🚫' : '⏳'}
+                  ⏳
                   {agents.find((a) => a.id === c.src_agent)?.name || c.src_agent}
                   → {agents.find((a) => a.id === c.dst_agent)?.name || c.dst_agent}
                 </span>
                 <span class="item-meta">
-                  {c.state} · {(c.prompt || '').slice(0, 32)}…
-                  {#if c.note}<span title={c.note}>· {c.note}</span>{/if}
-                  {#if c.state === 'armed'}
-                    <button class="chain-x" onclick={() => cancelChain(hc.host, c.chain_id)}>✕</button>
+                  <span class="chain-state {c.state}">{c.state}</span>
+                  <span class="meta-dot">·</span>
+                  <span class="chain-prompt">{(c.prompt || '').slice(0, 40)}</span>
+                  {#if c.note}
+                    <span class="chain-note" title={c.note}>⚠ {c.note}</span>
                   {/if}
+                  <button class="chain-x" onclick={() => cancelChain(hc.host, c.chain_id)}>✕</button>
                 </span>
               </div>
             {/each}
+            {#if doneCount > 0}
+              <div class="muted chain-done" title="Отработанные цепочки (история) не показываются карточками">
+                ✅ {doneCount} отработано · {hc.hostName}
+              </div>
+            {/if}
           {/each}
         </div>
       {/if}
@@ -1199,11 +1774,19 @@
         Dialogs
         {#if loading}<span class="muted">· loading…</span>{/if}
         {#if providerFilter.size}<span class="muted">· {[...providerFilter].join(', ')} ⏷</span>{/if}
+        {#if waitingDialogs.size}
+          <button class="wait-filter" class:on={onlyWaiting} title="Показать только сессии, ждущие твоего ответа"
+            onclick={() => (onlyWaiting = !onlyWaiting)}>⏳ ждут · {waitingDialogs.size}</button>
+        {/if}
       </div>
       {#if !loading && dialogs.length === 0}
         <div class="muted">No AI-chat history found in the fleet</div>
       {:else if !loading && visibleDialogs.length === 0}
-        <div class="muted">No history from the selected provider(s) · right-click to change</div>
+        {#if onlyWaiting}
+          <div class="muted">Никто не ждёт ответа 🎉 — живых сессий с открытым вопросом нет</div>
+        {:else}
+          <div class="muted">No history from the selected provider(s) · right-click to change</div>
+        {/if}
       {/if}
       {#each hostErrors as he}
         <div class="host-err" title={he.error}>
@@ -1211,15 +1794,15 @@
           {#if /decrypt|key/i.test(he.error)}<span class="muted"> — node is on a different token/key (or a stale socket is stuck under the same agent-id)</span>{/if}
         </div>
       {/each}
-      <div class="list" oncontextmenu={openHostMenu}>
+      <div class="list dialogs-list" oncontextmenu={openHostMenu}>
         {#each visibleDialogs as d}
           <div class="item" class:on={d.key === active}>
             <button class="item-open" onclick={() => openDialog(d)}>
               <span class="item-title">
-                {#if d.live}🟢 {/if}{d.title}
+                {#if d.live}{#if waitingDialogs.has(d.key)}🟠&nbsp;{:else}🟢&nbsp;{/if}{/if}{d.title}
               </span>
               <span class="item-meta">
-                <span class="prov {d.provider}">{d.provider}</span> · {d.hostName}
+                <span class="prov {d.provider}">{d.provider}</span> · {d.hostName}{#if d.alsoOn?.length} <span class="also-on" title={`Также на: ${d.alsoOn.join(', ')}`}>+{d.alsoOn.join(',')}</span>{/if}
               </span>
             </button>
             <button
@@ -1255,6 +1838,151 @@
     {/if}
   </div>
 
+  {#if showSearch}
+    <!-- svelte-ignore a11y_click_events_have_key_events -->
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div class="files-overlay search-overlay" onclick={(e) => { if (e.target === e.currentTarget) showSearch = false; }}>
+      <div class="alg-modal" role="dialog" aria-label="Search dialogs and mentions" onkeydown={onSearchModalKey}>
+        <div class="alg-bar">
+          <span class="alg-icon">🔍</span>
+          <input
+            id="alg-search-input"
+            name="search"
+            type="text"
+            aria-label="Поиск по чатам и сообщениям"
+            bind:this={searchInputEl}
+            bind:value={searchQuery}
+            oninput={onSearchInput}
+            placeholder="Искать слова в сообщениях, названия чатов, пути (например: veracrypt, kali, ssh)…"
+            autocomplete="off"
+          />
+          {#if searching}
+            <span class="alg-spin">⏳</span>
+          {:else if searchQuery}
+            <button type="button" class="alg-clear" aria-label="Очистить запрос" onclick={() => { clearSearch(); searchInputEl?.focus(); }}>✕</button>
+          {/if}
+          <button type="button" class="alg-esc" onclick={() => (showSearch = false)}>ESC</button>
+        </div>
+
+        <div class="alg-filters">
+          <button type="button" class="alg-chip" class:on={!searchHostFilter} onclick={() => (searchHostFilter = '')}>
+            Все хосты ({executors.length})
+          </button>
+          {#each executors as a}
+            <button type="button" class="alg-chip" class:on={searchHostFilter === a.id} onclick={() => (searchHostFilter = searchHostFilter === a.id ? '' : a.id)}>
+              @{a.name}
+            </button>
+          {/each}
+        </div>
+
+        <div class="alg-results">
+          {#if !searchQuery.trim()}
+            <div class="alg-empty">
+              <div class="alg-empty-title">Полнотекстовый поиск по истории чатов</div>
+              <p>Начни печатать — сразу увидишь упоминания внутри сообщений со всех хостов (BM25) и совпадения по названиям диалогов.</p>
+              <div class="alg-recent-head">Недавние диалоги</div>
+              {#each visibleDialogs.slice(0, 5) as d, idx}
+                <button type="button" class="alg-hit" onclick={() => { showSearch = false; openDialog(d); }}>
+                  <div class="alg-hit-top">
+                    <span class="alg-hit-title">{d.title}</span>
+                    <span class="alg-badges">
+                      <span class="prov {d.provider}">{d.provider}</span>
+                      <span class="alg-host">{d.hostName}{#if d.alsoOn?.length} +{d.alsoOn.join(',')}{/if}</span>
+                    </span>
+                  </div>
+                  {#if d.cwd}<div class="alg-cwd">{d.cwd}</div>{/if}
+                </button>
+              {/each}
+            </div>
+          {:else}
+            {#if visibleSearchHits.length > 0}
+              <div class="alg-sec-head">
+                💬 Упоминания в сообщениях · {visibleSearchHits.length}
+                {#if searching}<span class="muted">· обновляется…</span>{/if}
+              </div>
+              {#each visibleSearchHits as h, idx (h.host + ':' + h.provider + ':' + h.session_id + ':' + (h.seq ?? idx))}
+                <button
+                  type="button"
+                  class="alg-hit"
+                  class:selected={searchCursor === idx}
+                  onmouseenter={() => (searchCursor = idx)}
+                  onclick={() => openSearchHit(h)}
+                >
+                  <div class="alg-hit-top">
+                    <span class="alg-hit-title">
+                      {#each highlightParts(h.title || h.session_id, searchQuery) as seg}{#if seg.mark}<mark class="hl">{seg.text}</mark>{:else}{seg.text}{/if}{/each}
+                    </span>
+                    <span class="alg-badges">
+                      <span class="alg-badge-count">{h.match_count || 1} упом. · #{h.seq ?? 0}</span>
+                      <span class="prov {h.provider}">{h.provider}</span>
+                      <span class="alg-host">{h.hostName}</span>
+                    </span>
+                  </div>
+                  <div class="alg-snippet">
+                    <span class="alg-role">{h.role === 'user' ? '👤' : '🤖'}</span>
+                    <span>
+                      {#each highlightParts(h.snippet || '', searchQuery) as seg}{#if seg.mark}<mark class="hl">{seg.text}</mark>{:else}{seg.text}{/if}{/each}
+                    </span>
+                  </div>
+                  {#if h.cwd}
+                    <div class="alg-cwd">{h.cwd}</div>
+                  {/if}
+                </button>
+              {/each}
+            {/if}
+
+            {#if titleMatches.length > 0}
+              <div class="alg-sec-head">📂 Чаты по названию / пути · {titleMatches.length}</div>
+              {#each titleMatches as d, tidx (d.key)}
+                {@const rowIdx = visibleSearchHits.length + tidx}
+                <button
+                  type="button"
+                  class="alg-hit"
+                  class:selected={searchCursor === rowIdx}
+                  onmouseenter={() => (searchCursor = rowIdx)}
+                  onclick={() => { showSearch = false; activeMention = null; openDialog(d); }}
+                >
+                  <div class="alg-hit-top">
+                    <span class="alg-hit-title">
+                      {#each highlightParts(d.title, searchQuery) as seg}{#if seg.mark}<mark class="hl">{seg.text}</mark>{:else}{seg.text}{/if}{/each}
+                    </span>
+                    <span class="alg-badges">
+                      <span class="prov {d.provider}">{d.provider}</span>
+                      <span class="alg-host">{d.hostName}{#if d.alsoOn?.length} +{d.alsoOn.join(',')}{/if}</span>
+                    </span>
+                  </div>
+                  {#if d.cwd}
+                    <div class="alg-cwd">
+                      {#each highlightParts(d.cwd, searchQuery) as seg}{#if seg.mark}<mark class="hl">{seg.text}</mark>{:else}{seg.text}{/if}{/each}
+                    </div>
+                  {/if}
+                </button>
+              {/each}
+            {/if}
+
+            {#if !searching && visibleSearchHits.length === 0 && titleMatches.length === 0}
+              <div class="alg-empty">
+                <div class="alg-empty-title">Ничего не найдено по запросу «{searchQuery}»</div>
+                <p>{searchNote || 'Попробуй другое ключевое слово или часть команды/пути.'}</p>
+              </div>
+            {:else if searching && visibleSearchHits.length === 0 && titleMatches.length === 0}
+              <div class="alg-empty">
+                <div class="alg-empty-title">⏳ Ищем «{searchQuery}» по всем хостам…</div>
+                <p>Первый поиск может занять несколько секунд, пока строится локальный BM25-индекс.</p>
+              </div>
+            {/if}
+          {/if}
+        </div>
+
+        <footer class="alg-foot">
+          <span><kbd>↑</kbd><kbd>↓</kbd> навигация</span>
+          <span><kbd>↵</kbd> перейти к упоминанию</span>
+          <span><kbd>esc</kbd> закрыть</span>
+        </footer>
+      </div>
+    </div>
+  {/if}
+
   {#if showFiles}
     <div class="files-overlay" onclick={(e) => { if (e.target === e.currentTarget) showFiles = false; }}>
       <div class="files-modal">
@@ -1287,14 +2015,14 @@
           <button type="button" class="ghost" onclick={() => (showSettings = false)}>✕ Close</button>
         </header>
         <div class="settings-body">
-          <label>Relay URL</label>
-          <input bind:value={setRelay} placeholder="wss://relay-host" autocomplete="off" />
-          <label>Room</label>
-          <input bind:value={setRoom} placeholder="gpu" autocomplete="off" />
-          <label>Room key (token)</label>
-          <input bind:value={setToken} type="password" placeholder="••••••" autocomplete="off" />
-          <label>New PIN (optional)</label>
-          <input bind:value={setNewPin} type="password" inputmode="numeric" placeholder="leave blank to keep the current one" autocomplete="off" />
+          <label for="set-relay">Relay URL</label>
+          <input id="set-relay" name="relayUrl" bind:value={setRelay} placeholder="wss://relay-host" autocomplete="off" />
+          <label for="set-room">Room</label>
+          <input id="set-room" name="room" bind:value={setRoom} placeholder="gpu" autocomplete="off" />
+          <label for="set-token">Room key (token)</label>
+          <input id="set-token" name="token" bind:value={setToken} type="password" placeholder="••••••" autocomplete="off" />
+          <label for="set-pin">New PIN (optional)</label>
+          <input id="set-pin" name="newPin" bind:value={setNewPin} type="password" inputmode="numeric" placeholder="leave blank to keep the current one" autocomplete="off" />
           <p class="hint">Changes will reconnect to the fleet and re-encrypt the cookie with the current (or new) PIN.</p>
           {#if setErr}<div class="err">{setErr}</div>{/if}
           <div class="settings-actions">
@@ -1316,15 +2044,17 @@
           <button type="button" class="ghost" onclick={() => (showTunnels = false)}>✕ Close</button>
         </header>
         <div class="settings-body">
-          <label>Host</label>
-          <select bind:value={tunHost} onchange={refreshTunnels}>
+          <label for="tun-host">Host</label>
+          <select id="tun-host" name="tunHost" bind:value={tunHost} onchange={refreshTunnels}>
             {#each executors as a}
               <option value={a.id}>{a.name}</option>
             {/each}
           </select>
-          <label>Local target (port or address)</label>
+          <label for="tun-target">Local target (port or address)</label>
           <div class="tun-start">
             <input
+              id="tun-target"
+              name="tunTarget"
               bind:value={tunTarget}
               placeholder="3000 or http://localhost:3000"
               autocomplete="off"
@@ -1373,14 +2103,16 @@
             {agents.find((a) => a.id === lastDispatch.host)?.name || lastDispatch.host}) finishes,
             dispatch this prompt to the selected host with the previous result as context.
           </p>
-          <label>Follow-up host</label>
-          <select bind:value={thenHost}>
+          <label for="then-host">Follow-up host</label>
+          <select id="then-host" name="thenHost" bind:value={thenHost}>
             {#each aiHosts as a}
               <option value={a.id}>{a.name}{a.id === lastDispatch.host ? ' (same)' : ''}</option>
             {/each}
           </select>
-          <label>Follow-up prompt</label>
+          <label for="then-prompt">Follow-up prompt</label>
           <textarea
+            id="then-prompt"
+            name="thenPrompt"
             class="then-text"
             bind:value={thenPrompt}
             placeholder="e.g. Analyze the build log above and fix the failing tests"
@@ -2137,7 +2869,18 @@
     flex-direction: column;
     gap: 2px;
   }
+  /* Upper sidebar sections (In progress / Chains) must NEVER be crushed to 0px
+     by the huge Dialogs list's flex-shrink calculation. */
+  .compact-list {
+    flex: 0 0 auto;
+    max-height: 170px;
+  }
+  .dialogs-list {
+    flex: 1 1 0;
+    min-height: 120px;
+  }
   .item {
+    flex-shrink: 0;
     border-radius: 9px;
     display: flex;
     align-items: center;
@@ -2274,9 +3017,366 @@
     -webkit-box-orient: vertical;
     overflow: hidden;
   }
+  /* In-progress / chain cards: the two spans STACK (the base `.item` is a
+     flex ROW — with them as direct children the meta was pushed out of the
+     narrow sidebar and became invisible). */
   .item.progress {
+    opacity: 0.95;
+    width: 100%;
+    background: transparent;
+    border-left: 2px solid #e0a23a66;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 6px 4px 10px;
+  }
+  .item.progress.chain {
     cursor: default;
-    opacity: 0.92;
+    flex-direction: column;
+    align-items: stretch;
+    padding: 8px 11px;
+  }
+  .progress-open {
+    flex: 1;
+    min-width: 0;
+    background: transparent;
+    border: none;
+    text-align: left;
+    padding: 4px 2px;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .progress-acts {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    flex: none;
+  }
+  .prog-act {
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    padding: 3px 5px;
+    font-size: 11px;
+    opacity: 0.65;
+    line-height: 1;
+  }
+  .prog-act:hover {
+    opacity: 1;
+    background: var(--bg-3);
+    border-color: var(--line);
+  }
+  .prog-act.stop:hover {
+    color: #ff8a8a;
+    border-color: #ff8a8a55;
+  }
+  .item.progress.cron {
+    border-left-color: var(--line);
+  }
+  .item.progress .item-title {
+    font-size: 13px;
+  }
+  .item.progress .item-meta {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 4px;
+    min-width: 0;
+  }
+  .meta-host {
+    color: var(--text-dim);
+  }
+  .meta-dot {
+    color: var(--text-faint);
+  }
+  .meta-state.run {
+    color: #e0a23a;
+  }
+  .item.progress.chain {
+    border-left-color: #3f8f5f55;
+  }
+  .chain-state.fired {
+    color: #6fcf8e;
+  }
+  .chain-state.armed {
+    color: #e0a23a;
+  }
+  .chain-state.cancelled {
+    color: var(--text-faint);
+  }
+  .chain-prompt {
+    color: var(--text-dim);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 100%;
+  }
+  .chain-note {
+    color: #ff8a8a;
+    font-size: 10px;
+  }
+  .chain-done {
+    font-size: 10px;
+    padding: 4px 11px;
+  }
+  .also-on {
+    font-size: 10px;
+    color: var(--text-faint);
+    opacity: 0.85;
+  }
+
+  /* Algolia-style search trigger & modal */
+  .algolia-trigger {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 8px 10px;
+    color: var(--text-dim);
+    font-size: 13px;
+    text-align: left;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .algolia-trigger:hover {
+    border-color: var(--accent);
+    color: var(--text);
+  }
+  .alg-left {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .alg-kbd {
+    flex: none;
+    font-size: 10px;
+    padding: 2px 5px;
+    border-radius: 5px;
+    background: var(--bg-3);
+    border: 1px solid var(--line);
+    color: var(--text-faint);
+    font-family: inherit;
+  }
+  .search-overlay {
+    align-items: flex-start;
+    padding-top: 7vh;
+  }
+  .alg-modal {
+    width: min(760px, 94vw);
+    max-height: 82vh;
+    background: var(--bg-2);
+    border: 1px solid #4d6bfe55;
+    border-radius: 16px;
+    box-shadow: 0 24px 64px rgba(0, 0, 0, 0.65);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .alg-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--line);
+    background: var(--bg);
+  }
+  .alg-icon {
+    font-size: 16px;
+  }
+  .alg-bar input {
+    flex: 1;
+    background: transparent;
+    border: none;
+    color: var(--text);
+    font-size: 16px;
+    outline: none;
+  }
+  .alg-clear,
+  .alg-esc {
+    background: var(--bg-3);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    color: var(--text-dim);
+    font-size: 11px;
+    padding: 3px 7px;
+  }
+  .alg-filters {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 8px 16px;
+    border-bottom: 1px solid var(--line);
+    background: var(--bg-2);
+  }
+  .alg-chip {
+    background: var(--bg-3);
+    border: 1px solid transparent;
+    border-radius: 999px;
+    padding: 3px 10px;
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+  .alg-chip.on {
+    background: var(--accent-soft);
+    border-color: var(--accent);
+    color: var(--text);
+  }
+  .alg-results {
+    flex: 1;
+    overflow-y: auto;
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .alg-sec-head,
+  .alg-recent-head {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-faint);
+    padding: 6px 6px 2px;
+  }
+  .alg-hit {
+    width: 100%;
+    text-align: left;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 11px;
+    padding: 10px 13px;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    transition: border-color 0.12s, background 0.12s;
+  }
+  .alg-hit:hover,
+  .alg-hit.selected {
+    background: var(--bg-3);
+    border-color: var(--accent);
+  }
+  .alg-hit-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+  }
+  .alg-hit-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .alg-badges {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: none;
+    font-size: 11px;
+  }
+  .alg-badge-count {
+    background: var(--accent-soft);
+    color: #9bb0ff;
+    border-radius: 5px;
+    padding: 1px 6px;
+    font-size: 10px;
+  }
+  .alg-host {
+    color: var(--text-dim);
+  }
+  .alg-snippet {
+    font-size: 13px;
+    color: var(--text-dim);
+    line-height: 1.45;
+    display: flex;
+    gap: 6px;
+    align-items: baseline;
+    word-break: break-word;
+  }
+  .alg-role {
+    flex: none;
+    font-size: 12px;
+  }
+  .alg-cwd {
+    font-size: 11px;
+    color: var(--text-faint);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  .alg-empty {
+    padding: 20px 10px;
+    color: var(--text-dim);
+    font-size: 13px;
+  }
+  .alg-empty-title {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text);
+    margin-bottom: 4px;
+  }
+  .alg-foot {
+    display: flex;
+    gap: 16px;
+    padding: 9px 16px;
+    border-top: 1px solid var(--line);
+    background: var(--bg);
+    font-size: 11px;
+    color: var(--text-faint);
+  }
+  .alg-foot kbd {
+    background: var(--bg-3);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 1px 5px;
+    margin-right: 3px;
+    font-size: 10px;
+  }
+  mark.hl {
+    background: #4d6bfe3d;
+    color: #fff;
+    padding: 0 3px;
+    border-radius: 4px;
+    border-bottom: 1px solid #7d94ff;
+  }
+  mark.hl.current {
+    background: #e0a23a66;
+    border-bottom: 2px solid #ffd166;
+  }
+  .mention-bar {
+    position: sticky;
+    top: 8px;
+    z-index: 15;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin: 4px 24px 8px;
+    padding: 8px 12px;
+    background: #1e2235ee;
+    backdrop-filter: blur(8px);
+    border: 1px solid #4d6bfe88;
+    border-radius: 10px;
+    font-size: 12px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  }
+  .mention-acts {
+    display: flex;
+    gap: 6px;
+  }
+  .bubble.mention-hit {
+    border: 1px solid #4d6bfeaa;
+    box-shadow: 0 0 0 2px #4d6bfe22;
   }
   .prov {
     border-radius: 4px;
@@ -2316,8 +3416,65 @@
   .prov.continue {
     color: #d6b8ff;
   }
+  /* drag-and-drop overlay: covers the chat pane while files are held over
+     it; pointer-events:none so the drop itself reaches the pane handler */
+  .dropzone {
+    position: absolute;
+    inset: 0;
+    z-index: 30;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #4d6bfe1c;
+    border: 2px dashed #4d6bfe;
+    border-radius: 12px;
+    pointer-events: none;
+  }
+  .dropzone-card {
+    background: var(--bg-3);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 18px 26px;
+    font-size: 14px;
+    text-align: center;
+    box-shadow: 0 8px 30px #00000066;
+  }
+  .dropzone-note {
+    margin-top: 6px;
+    font-size: 11px;
+    color: var(--text-faint);
+  }
   .live-tag {
     color: #5ad17f;
+  }
+  /* needs-you: a live session blocked on a pending question / permission */
+  .wait-tag {
+    color: #e0a23a;
+  }
+  .bubble.waiting {
+    border-color: #e0a23a88;
+  }
+  .wait-line {
+    color: #e0a23a;
+    font-size: 11px;
+    margin-bottom: 4px;
+  }
+  .wait-banner {
+    border-color: #e0a23a88;
+  }
+  .wait-filter {
+    background: transparent;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    color: #e0a23a;
+    font-size: 10px;
+    padding: 1px 7px;
+    cursor: pointer;
+    margin-left: auto;
+  }
+  .wait-filter.on {
+    background: #e0a23a22;
+    border-color: #e0a23a;
   }
   .ghost.danger {
     color: #ff8a8a;
@@ -2340,8 +3497,13 @@
       font-size: 16px;
     }
     .bar {
-      padding: 12px 16px;
-      gap: 8px;
+      padding: 10px 12px;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+    .bar-left {
+      flex: 1 1 100%;
+      min-width: 0;
     }
     /* Compact header on mobile: show icons only, drop the text labels. */
     .ghost.ic span {

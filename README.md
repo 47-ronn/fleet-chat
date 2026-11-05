@@ -30,9 +30,16 @@ host's AI delegate sub-tasks to specific peers.
 
 ```bash
 npm install
-npm run dev      # http://localhost:5180
+npm run dev      # http://localhost:5180 (also reachable from LAN/VMs,
+                 #  e.g. http://192.168.122.1:5180)
 npm run build    # static bundle in dist/ (host anywhere, e.g. a CF Pages site)
 ```
+
+Browsers only expose `crypto.subtle` (the E2E engine) in secure contexts —
+https or localhost. On plain http (dev from LAN/VMs) the app transparently
+falls back to a pure-JS WebCrypto (`@peculiar/webcrypto`, wire-compatible
+AES-256-GCM/SHA-256/PBKDF2); on https it stays native. Relay URLs may then be
+`ws://` (no mixed-content blocks on an http page).
 
 Log in with the relay URL, room name, and the room token (e.g.
 `wss://<relay>` / `gpu` / `<token>`).

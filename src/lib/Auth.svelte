@@ -69,9 +69,11 @@
       <h1>Fleet&nbsp;Chat</h1>
       <p class="sub">Enter your PIN to decrypt your saved data</p>
 
-      <label>PIN</label>
+      <label for="auth-pin">PIN</label>
       <!-- svelte-ignore a11y_autofocus -->
       <input
+        id="auth-pin"
+        name="pin"
         bind:value={pin}
         type="password"
         inputmode="numeric"
@@ -80,7 +82,7 @@
         autofocus
       />
 
-      {#if error}<div class="err">{error}</div>{/if}
+      {#if error}<div class="err" role="alert">{error}</div>{/if}
 
       <button type="submit" disabled={busy || !pin}>
         {busy ? 'Connecting…' : 'Sign in'}
@@ -94,17 +96,19 @@
       <h1>Fleet&nbsp;Chat</h1>
       <p class="sub">Connect to the fleet and create a PIN</p>
 
-      <label>Relay URL</label>
-      <input bind:value={relayUrl} placeholder="wss://relay-host" autocomplete="off" />
+      <label for="auth-relay">Relay URL</label>
+      <input id="auth-relay" name="relayUrl" bind:value={relayUrl} placeholder="wss://relay-host" autocomplete="off" />
 
-      <label>Room</label>
-      <input bind:value={room} placeholder="room name" autocomplete="off" />
+      <label for="auth-room">Room</label>
+      <input id="auth-room" name="room" bind:value={room} placeholder="room name" autocomplete="off" />
 
-      <label>Room key (token)</label>
-      <input bind:value={token} type="password" placeholder="••••••" autocomplete="off" />
+      <label for="auth-token">Room key (token)</label>
+      <input id="auth-token" name="token" bind:value={token} type="password" placeholder="••••••" autocomplete="off" />
 
-      <label>Create a PIN (≥{PIN_MIN})</label>
+      <label for="auth-new-pin">Create a PIN (≥{PIN_MIN})</label>
       <input
+        id="auth-new-pin"
+        name="pin"
         bind:value={pin}
         type="password"
         inputmode="numeric"
@@ -112,8 +116,10 @@
         autocomplete="off"
       />
 
-      <label>Repeat PIN</label>
+      <label for="auth-repeat-pin">Repeat PIN</label>
       <input
+        id="auth-repeat-pin"
+        name="pin2"
         bind:value={pin2}
         type="password"
         inputmode="numeric"
@@ -126,7 +132,7 @@
         The PIN itself is never saved — without it, the cookie is useless.
       </p>
 
-      {#if error}<div class="err">{error}</div>{/if}
+      {#if error}<div class="err" role="alert">{error}</div>{/if}
 
       <button type="submit" disabled={busy || !room.trim() || !token || !pin}>
         {busy ? 'Connecting…' : 'Save and sign in'}

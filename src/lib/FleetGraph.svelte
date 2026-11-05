@@ -39,6 +39,90 @@
     return [...m.values()];
   });
 
+  // Per-edge anchor slots. A node's k outgoing edges fan out across its BOTTOM
+  // border and its incoming edges fan in across the TOP border of the target —
+  // without this every edge of a node starts/ends at one centre dot, edges
+  // visually merge, and the labels of two crossing edges land on the same
+  // midpoint.
+  const anchors = $derived.by(() => {
+    const outs = new Map(); // from -> [edges]
+    const ins = new Map(); // to -> [edges]
+    for (const e of edges) {
+      (outs.get(e.from) || outs.set(e.from, []).get(e.from)).push(e);
+      (ins.get(e.to) || ins.set(e.to, []).get(e.to)).push(e);
+    }
+    const slots = new Map(); // "from>to" -> {i, nOut, j, nIn}
+    for (const [from, list] of outs) {
+      list.forEach((e, i) => {
+        const inList = ins.get(e.to);
+        slots.set(`${e.from}>${e.to}`, {
+          i,
+          nOut: list.length,
+          j: inList.indexOf(e),
+          nIn: inList.length,
+        });
+      });
+    }
+    return slots;
+  });
+
+  // Edge geometry + on-curve label placement. Labels start at a parity-
+  // staggered t (.38/.62 by out-slot) and then a small relaxation pass nudges
+  // t apart for any pair whose estimated boxes overlap — crossing edges in a
+  // symmetric layout always share a height, so fixed offsets alone can't win.
+  const edgeGeom = $derived.by(() => {
+    const items = [];
+    for (const e of edges) {
+      const p1 = layout.pos.get(e.from);
+      const p2 = layout.pos.get(e.to);
+      const s = anchors.get(`${e.from}>${e.to}`);
+      if (!p1 || !p2 || !s) continue;
+      const x1 = p1.x + ((s.i + 1) / (s.nOut + 1)) * NODE_W;
+      const y1 = p1.y + NODE_H;
+      const x2 = p2.x + ((s.j + 1) / (s.nIn + 1)) * NODE_W;
+      const y2 = p2.y;
+      items.push({
+        key: `${e.from}>${e.to}`,
+        x1, y1, x2, y2,
+        dy: Math.min(40, (y2 - y1) / 2),
+        t: s.i % 2 ? 0.62 : 0.38,
+        badge: edgeBadge(e.tasks),
+      });
+    }
+    const at = (it) => {
+      const u = 1 - it.t;
+      return {
+        x: u * u * u * it.x1 + 3 * u * u * it.t * it.x1 + 3 * u * it.t * it.t * it.x2 + it.t ** 3 * it.x2,
+        y: u * u * u * it.y1 + 3 * u * u * it.t * (it.y1 + it.dy) + 3 * u * it.t * it.t * (it.y2 - it.dy) + it.t ** 3 * it.y2,
+      };
+    };
+    const W = (it) => it.badge.length * 6.2 + 4; // ≈ font 10px, digits/symbols
+    const pairOverlap = (ia, ib) => {
+      const pa = at(ia);
+      const pb = at(ib);
+      return Math.abs(pa.x - pb.x) < (W(ia) + W(ib)) / 2 + 2 && Math.abs(pa.y - pb.y) < 12;
+    };
+    for (let pass = 0; pass < 6; pass++) {
+      let moved = false;
+      for (let a = 0; a < items.length; a++) {
+        for (let b = a + 1; b < items.length; b++) {
+          if (!pairOverlap(items[a], items[b])) continue;
+          items[a].t = Math.max(0.15, items[a].t - 0.16);
+          items[b].t = Math.min(0.85, items[b].t + 0.16);
+          moved = true;
+        }
+      }
+      if (!moved) break;
+    }
+    return new Map(items.map((it) => [it.key, { ...it, ...at(it) }]));
+  });
+
+  // id -> online (the virtual browser node is always "online") — offline nodes
+  // keep their edges but faded, so a dead host doesn't look like a live path.
+  const onlineMap = $derived(
+    new Map(nodes.map((n) => [n.id, n.id === BROWSER || !!n.online]))
+  );
+
   // All involved node ids: agents with tasks (either side) + everyone else in
   // the room, so idle hosts still show up.
   const nodes = $derived.by(() => {
@@ -194,34 +278,40 @@
     <span class="lg">click a node for its tasks &amp; roles</span>
   </div>
 
+  <div class="graph-body">
   <div class="graph-scroll">
     <svg width={layout.W} height={layout.H} role="img" aria-label="Fleet dependency graph">
       {#each edges as e (e.from + '>' + e.to)}
-        {@const p1 = layout.pos.get(e.from)}
-        {@const p2 = layout.pos.get(e.to)}
+        {@const g = edgeGeom.get(e.from + '>' + e.to)}
         {@const dim = sel && e.from !== sel && e.to !== sel}
-        {#if p1 && p2}
-          {@const x1 = p1.x + NODE_W / 2}
-          {@const y1 = p1.y + NODE_H}
-          {@const x2 = p2.x + NODE_W / 2}
-          {@const y2 = p2.y}
-          {@const mx = (x1 + x2) / 2}
-          {@const my = (y1 + y2) / 2}
+        {@const off = g && !(onlineMap.get(e.from) && onlineMap.get(e.to))}
+        {#if g}
+          {@const col = edgeColor(e.tasks, dim)}
+          {@const faded = dim ? 0.5 : off ? 0.35 : 1}
           <path
-            d="M {x1} {y1} C {x1} {y1 + 40}, {x2} {y2 - 40}, {x2} {y2}"
+            d="M {g.x1} {g.y1} C {g.x1} {g.y1 + g.dy}, {g.x2} {g.y2 - g.dy}, {g.x2} {g.y2}"
             fill="none"
-            stroke={edgeColor(e.tasks, dim)}
-            stroke-width={dim ? 1 : 2}
-            stroke-opacity={dim ? 0.5 : 1}
+            stroke={col}
+            stroke-width={dim || off ? 1.5 : 2}
+            stroke-opacity={faded}
           />
-          <circle cx={x2} cy={y2} r="3" fill={edgeColor(e.tasks, dim)} />
+          <!-- source dot + arrowhead into the executor (the curve always
+               enters vertically: control point sits straight below x2) -->
+          <circle cx={g.x1} cy={g.y1} r="3" fill={col} fill-opacity={faded} />
+          <polygon
+            points="{g.x2},{g.y2} {g.x2 - 4.5},{g.y2 - 9} {g.x2 + 4.5},{g.y2 - 9}"
+            fill={col}
+            fill-opacity={faded}
+          />
+          <!-- badge ON the curve, lifted above it; placement relaxed so
+               crossing edges don't drop labels on the same spot -->
           <text
-            x={mx}
-            y={my}
+            x={g.x}
+            y={g.y - 6}
             text-anchor="middle"
             class="edge-label"
-            fill={dim ? '#ffffff44' : '#cdd7ff'}
-          >{edgeBadge(e.tasks)}</text>
+            fill={dim ? '#ffffff44' : off ? '#ffffff66' : '#cdd7ff'}
+          >{g.badge}</text>
         {/if}
       {/each}
 
@@ -307,14 +397,15 @@
       {/if}
     </aside>
   {/if}
+  </div>
 </div>
 
 <style>
   .graph-wrap {
     display: flex;
+    flex-direction: column; /* legend bar on top, body below */
     flex: 1;
     min-height: 0;
-    gap: 12px;
   }
   .legend {
     display: flex;
@@ -324,6 +415,12 @@
     border-bottom: 1px solid var(--line);
     font-size: 12px;
     color: var(--text-dim);
+  }
+  .graph-body {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+    gap: 12px;
   }
   .graph-wrap :global(.graph-scroll) {
     flex: 1;

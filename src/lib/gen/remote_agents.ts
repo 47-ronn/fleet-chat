@@ -230,6 +230,8 @@ export interface SessionMessage {
   role: string;
   text: string;
   ts?: number | undefined;
+  /** Tool name this turn is blocked on (question/permission still PENDING a human answer) — the "needs you" signal for the panel's live badges. */
+  waiting?: string | undefined;
 }
 
 /**
@@ -1534,7 +1536,7 @@ export const SessionMeta: MessageFns<SessionMeta> = {
 };
 
 function createBaseSessionMessage(): SessionMessage {
-  return { role: "", text: "", ts: undefined };
+  return { role: "", text: "", ts: undefined, waiting: undefined };
 }
 
 export const SessionMessage: MessageFns<SessionMessage> = {
@@ -1547,6 +1549,9 @@ export const SessionMessage: MessageFns<SessionMessage> = {
     }
     if (message.ts !== undefined) {
       writer.uint32(24).uint64(message.ts);
+    }
+    if (message.waiting !== undefined) {
+      writer.uint32(34).string(message.waiting);
     }
     return writer;
   },
@@ -1582,6 +1587,14 @@ export const SessionMessage: MessageFns<SessionMessage> = {
           message.ts = longToNumber(reader.uint64());
           continue;
         }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.waiting = reader.string();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -1596,6 +1609,7 @@ export const SessionMessage: MessageFns<SessionMessage> = {
       role: isSet(object.role) ? globalThis.String(object.role) : "",
       text: isSet(object.text) ? globalThis.String(object.text) : "",
       ts: isSet(object.ts) ? globalThis.Number(object.ts) : undefined,
+      waiting: isSet(object.waiting) ? globalThis.String(object.waiting) : undefined,
     };
   },
 
@@ -1610,6 +1624,9 @@ export const SessionMessage: MessageFns<SessionMessage> = {
     if (message.ts !== undefined) {
       obj.ts = Math.round(message.ts);
     }
+    if (message.waiting !== undefined) {
+      obj.waiting = message.waiting;
+    }
     return obj;
   },
 
@@ -1621,6 +1638,7 @@ export const SessionMessage: MessageFns<SessionMessage> = {
     message.role = object.role ?? "";
     message.text = object.text ?? "";
     message.ts = object.ts ?? undefined;
+    message.waiting = object.waiting ?? undefined;
     return message;
   },
 };

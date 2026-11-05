@@ -254,6 +254,15 @@ export class Relay {
     return res.result_type === 'task' ? res.task : null;
   }
 
+  async taskCancel(agentId, id) {
+    const res = await this.sendCommand(agentId, { cmd: 'task_cancel', id }, 10000);
+    return res.result_type === 'task' ? res.task : null;
+  }
+
+  async taskInput(agentId, id, input) {
+    await this.sendCommand(agentId, { cmd: 'task_input', id, input }, 10000);
+  }
+
   async scheduleList(agentId) {
     const res = await this.sendCommand(agentId, { cmd: 'schedule_list' }, 8000);
     return res.result_type === 'schedule' ? res.tasks || [] : [];
@@ -420,6 +429,21 @@ export class Relay {
       await Promise.all(batch);
     }
     return new Blob(parts, mime ? { type: mime } : undefined);
+  }
+
+  // --- Text-file upload (drag-and-drop attachments) --------------------------
+  //
+  // WriteFile on the host: content is a UTF-8 string on the wire (protobuf
+  // `string`), so this is for TEXT attachments only — binary files would be
+  // corrupted and must be referenced by their on-host path instead. The
+  // host's own write cap is 10 MiB, but the relay's ~1 MiB frame bounds us
+  // well below that (the panel's outbound commands aren't zstd-compressed).
+  async writeFile(agentId, path, content) {
+    await this.sendCommand(
+      agentId,
+      { cmd: 'write_file', path, content, create_backup: false },
+      30000
+    );
   }
 
   // --- Host↔host transfer ---
