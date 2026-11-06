@@ -5,7 +5,7 @@
   import BrainField from './lib/BrainField.svelte';
   import HowItWorks from './lib/HowItWorks.svelte';
 
-  const GITHUB = 'https://github.com/47-ronn/tunshell_mcp_agents';
+  const GITHUB = 'https://github.com/47-ronn/remote-agents-mcp';
   const NPM = 'https://www.npmjs.com/package/remote-agents';
 
   // The brain animation is heavy (WebGL + ~100k points), so skip it on phones/
