@@ -4,13 +4,22 @@
   import Files from './lib/Files.svelte';
   import FleetGraph from './lib/FleetGraph.svelte';
   import Icon from './lib/Icon.svelte';
+  import ShareModal from './lib/ShareModal.svelte';
   import { scale } from 'svelte/transition';
   import { storeCreds, clearCreds } from './lib/creds.js';
+  import { openSharePayload } from './lib/share.js';
+
+  // Share-room QR link payload (from `#/app/join/<b64>`), see App.svelte.
+  let { joinPayload = null } = $props();
 
   let relay = $state(null);
   let showFiles = $state(false); // file-browser overlay visibility
   let showGraph = $state(false); // agent dependency-graph overlay
   let showSettings = $state(false); // credentials/settings overlay
+  let showShare = $state(false); // share-room (QR + bootstrap scripts) overlay
+  let joinCode = $state(''); // code typed for a pending share-link join
+  let joinErr = $state('');
+  let joinBusy = $state(false);
   // Current connection credentials (for the settings form). The PIN is kept in
   // memory only for re-encrypting on a settings change — never persisted.
   let creds = $state({ relayUrl: '', room: '', token: '' });
@@ -575,6 +584,36 @@
     await refreshFleet();
     clearInterval(pollTimer);
     pollTimer = setInterval(pollFleet, 5000);
+  }
+
+  // --- share-link join (QR) --------------------------------------------------
+  // A scanned `#/app/join/<payload>` lands here via the `joinPayload` prop.
+  // Ask for the 6-digit code, decrypt (TTL enforced inside), then connect —
+  // reusing the normal connect path including PIN storage on success.
+  async function doJoin(e) {
+    e.preventDefault();
+    joinErr = '';
+    if (!joinPayload) return;
+    if (joinCode.length !== 6) {
+      joinErr = 'код — 6 цифр';
+      return;
+    }
+    joinBusy = true;
+    try {
+      const creds2 = await openSharePayload(joinPayload, joinCode);
+      if (!creds2) {
+        joinErr = 'код неверен или ссылка истекла (TTL 2 мин) — попроси новую';
+        return;
+      }
+      joinCode = '';
+      await onConnect({ ...creds2 }); // connect + nothing persisted (no PIN)
+      // Данные комнаты расшифрованы — предложим сохранить их как обычно
+      // (пользователь задаст PIN через Settings → Save).
+    } catch (err) {
+      joinErr = err.message || String(err);
+    } finally {
+      joinBusy = false;
+    }
   }
 
   // Apply edited credentials from the settings panel: reconnect, then re-encrypt
@@ -1438,7 +1477,31 @@
 <svelte:window onkeydown={onGlobalKey} />
 
 {#if !authed}
-  <Auth onConnect={onConnect} />
+  {#if joinPayload}
+    <div class="auth-wrap" style="display:grid;place-items:center;height:100%">
+      <form class="join-card" onsubmit={doJoin}>
+        <h1 style="margin:0;font-size:24px">📱 Join by QR</h1>
+        <p style="color:var(--text-dim);font-size:13px;margin:8px 0 16px">
+          Введи 6-значный код с экрана, кто поделился комнатой.
+        </p>
+        <input
+          bind:value={joinCode}
+          type="text"
+          inputmode="numeric"
+          maxlength="6"
+          placeholder="••••••"
+          style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:11px 13px;color:var(--text);font-size:18px;letter-spacing:4px;text-align:center;outline:none"
+          autofocus
+        />
+        {#if joinErr}<div style="color:#ff7a7a;font-size:13px;margin-top:10px">{joinErr}</div>{/if}
+        <button type="submit" disabled={joinBusy} style="margin-top:16px;width:100%;background:var(--accent);border:none;border-radius:10px;padding:12px;color:#fff;font-weight:600">
+          {joinBusy ? 'Подключение…' : 'Войти в комнату'}
+        </button>
+      </form>
+    </div>
+  {:else}
+    <Auth onConnect={onConnect} />
+  {/if}
 {:else}
   <div class="main">
     <!-- Chat pane (left) -->
@@ -1497,6 +1560,7 @@
         <button class="ghost ic" onclick={() => (showGraph = true)} title="Agent graph"><Icon name="cloud" /><span>Graph</span></button>
         <button class="ghost ic" onclick={openTunnels} title="Tunnels"><Icon name="cloud" /><span>Tunnels</span></button>
         <button class="ghost ic icon-only" onclick={openSettings} title="Settings" aria-label="Settings"><Icon name="settings" /></button>
+        <button class="ghost ic icon-only" onclick={() => (showShare = true)} title="Share room (QR + bootstrap)" aria-label="Share room">🔗</button>
         <button class="ghost ic" onclick={logout} title="Log out"><Icon name="logout" /><span>Log out</span></button>
         <button
           class="ghost ic icon-only menu-toggle"
@@ -2005,6 +2069,10 @@
         <FleetGraph {agents} fleets={fleetTasks} />
       </div>
     </div>
+  {/if}
+
+  {#if showShare && authed}
+    <ShareModal creds={creds} onclose={() => (showShare = false)} />
   {/if}
 
   {#if showSettings}
